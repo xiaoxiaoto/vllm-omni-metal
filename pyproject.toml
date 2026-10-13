@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-omni-metal"
+version = "0.1.0"
+description = "Apple Silicon MPS platform plugin for vLLM-Omni"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+dependencies = [
+    "vllm-metal==0.30.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "vllm-omni==0.30.0",
+    "torch>=2.13",
+    "diffusers>=0.40,<0.41",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.9"]
+
+[project.entry-points."vllm_omni.platform_plugins"]
+metal = "vllm_omni_metal:register_platform"
+
+[tool.setuptools.packages.find]
+include = ["vllm_omni_metal*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: real MPS engine tests (set VLLM_OMNI_METAL_INTEGRATION=1)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
