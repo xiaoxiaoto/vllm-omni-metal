@@ -18,7 +18,7 @@
 
 ### KV 与 attention
 
-遵守 0.30 的 `KVCacheTensor.layers / offset / layer_stride / block_stride` 合同，用 device byte backing 和显式 strided view 映射物理页，而不是假定所有层共享同一 contiguous tensor。
+遵守 0.31 的 `KVCacheTensor.layers / offset / layer_stride / block_stride` 合同，用 device byte backing 和显式 strided view 映射物理页，而不是假定所有层共享同一 contiguous tensor。
 
 按请求 block table 写入当前 token K/V，读取实际 sequence 长度；支持 GQA 和 sliding-window causal mask。decode 使用历史长度作为 causal offset，不丢弃过去的 KV、不读取无效尾部。不同 cache group 使用对应的 block table。
 
@@ -30,11 +30,13 @@ KV 预算基于 MPS 用量及系统可用内存，保留 3 GiB 系统 headroom�
 
 处理 new/cached/resumed/finished 请求、外部 request ID、token history 和独立 MPS RNG。普通模型只接收其 forward 签名接受的 kwargs；原生模型仍可接收 Omni runtime information、seq counts 和 query boundaries。
 
-复用模型的 `preprocess`、`update_decode_step_metadata`、`prefer_model_sampler` / `sample`、`postprocess`、`make_omni_output` 及结束 hook。标准 sampler 保留 penalty、top-k/top-p、allowed tokens、bad words、logit bias 和 min-token stop 约束。
+复用模型的 `preprocess`、`prepare_runner_inputs`、`update_decode_step_metadata`、`prefer_model_sampler` / `sample`、`postprocess`、`make_omni_output` 及结束 hook。`prepare_runner_inputs` 获得实际请求 token span 和 computed/scheduled counts；声明 `accepts_runner_sampling_extra_args` 时才传递请求级 `extra_args` 和 partial-prefill discard mask。返回 tensor 不得改变调度长度、设备或整数 dtype。标准 sampler 保留 penalty、top-k/top-p、allowed tokens、bad words、logit bias 和 min-token stop 约束。
 
 pre/postprocess 按实际请求 token span 运行，不把全 batch 或单个 logits row 误当完整请求。上游 state-free payload builder 负责拆分输出；hidden states 和 multimodal tensor 迁至 CPU 后跨阶段传输。输出浮点 payload 拒绝 NaN/Inf。
 
-encoder multimodal 输入、prompt embeddings、auxiliary Talker MTP、稀疏输出路由、logprobs、structured decoding、prefix/model-state cache、LoRA、跨引擎 KV、sleep/offload 未实现；不要只解除错误检查来“支持”它们。
+`make_omni_output` 在模型 sampler 之前建立当前步输出，sampler 追加的终结音频保留在同一步。稀疏音频复用上游 marker/请求 ID 解析和 payload builder，按 `meta.req_id` 对齐而非 batch 下标；拒绝非法、重复、未知 ID 和不匹配的列表长度。空稀疏步和未输出的请求返回空 payload，不附带 hidden states 或其他请求的共享字段。平台层不识别具体模型名称。
+
+encoder multimodal 输入、prompt embeddings、auxiliary Talker MTP、logprobs、structured decoding、prefix/model-state cache、LoRA、跨引擎 KV、sleep/offload 未实现；不要只解除错误检查来“支持”它们。
 
 ### Shared memory 与 capture 查询
 
@@ -58,13 +60,13 @@ MLX facade 声明 `metal_runtime='mlx'`，自行实现无参数 `load_weights()`
 ## 可执行验收
 
 ```bash
-.venv/bin/python -m pytest -q -m 'not integration'
-.venv/bin/ruff check .
-.venv/bin/ruff format --check .
+.venv-vllm-omni-metal/bin/python -m pytest -q -m 'not integration'
+.venv-vllm-omni-metal/bin/ruff check .
+.venv-vllm-omni-metal/bin/ruff format --check .
 
 VLLM_OMNI_METAL_INTEGRATION=1 \
 VLLM_OMNI_METAL_NATIVE_MODEL=/path/to/local/higgs-checkpoint \
-  .venv/bin/python -m pytest -q
+  .venv-vllm-omni-metal/bin/python -m pytest -q
 ```
 
 - 数学 gate：分块 prefill/decode 对完整 causal SDPA、GQA、不连续页、跨请求和无效页检查。

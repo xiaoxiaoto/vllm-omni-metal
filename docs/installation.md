@@ -1,83 +1,85 @@
-# 安装
+# 安装与 0.31 升级
 
-参考 vllm-metal 的 Homebrew / curl / 源码三种入口，运行时统一采用独立 Python 3.12 环境和预编译 macOS arm64 wheel，不改系统 Python或已安装的 vllm-metal 私有环境。
+使用独立 Python 3.12 环境和官方 macOS arm64 wheel，不修改系统 Python、原有 `.venv` 或 vllm-metal 的 Homebrew 私有环境。
 
-## 依赖基线
+## 固定依赖
 
-- 原生 Apple Silicon、macOS **15+**，不支持 Rosetta x86_64。
-- vLLM `0.30.0+cpu` 与 vllm-metal `0.30.0` 的官方预编译 wheel，固定 SHA256。
-- vllm-omni 固定 `v0.30.0` 对应 commit，设置 `VLLM_OMNI_TARGET_DEVICE=cpu` 和 `VLLM_OMNI_VERSION_OVERRIDE=0.30.0+cpu`。**前者不是 `VLLM_TARGET_DEVICE`**；漏掉时隔离构建可能误选 CUDA。
-- PyTorch 2.13 提供 MPS generator。不追踪上游 latest/dev，PyPI CUDA wheel 不是 macOS 安装方案。
+- 原生 Apple Silicon、macOS **15+**，不支持 Rosetta。
+- vLLM **0.31.0+cpu** 和 vllm-metal **0.31.0**（本次核对的最新稳定版），官方预编译 wheel，SHA256 固定在 Formula 和安装器。
+- Omni 最新稳定 tag 仍为 0.30.0。为使用 YuE2 等新集成，固定 main **`2ec5f265c69520cdd5e5f0a19db485d38885843e`**，构建为 **`0.31.0.dev0+cpu`**，明确是开发快照，不冒充稳定 release。
+- 构建设置 `VLLM_OMNI_TARGET_DEVICE=cpu` 和 `VLLM_OMNI_VERSION_OVERRIDE=0.31.0.dev0+cpu`；前者不是 `VLLM_TARGET_DEVICE`。
+- 本次完整解析得到 PyTorch 2.13.0、Transformers 5.14.1、MLX 0.32.1、diffusers 0.40.0。Omni 限定 Transformers `>=5.13,<5.15`；不能绕过这些约束只升级某个包。
 
-本插件是纯 Python；vllm-metal 自带已编译的 native artifacts，不需要按它的源码开发流程重新编译 kernel。Omni CPU 包及少量 Python 依赖仍可能需要构建工具。安装需要联网获取 Python/依赖和 Git 源码，但不下载模型。
+本插件是纯 Python；无需编译 Metal kernel。安装需要联网下载依赖和 Git 源码，不下载模型。不要用 PyPI CUDA vLLM wheel 替代 macOS CPU wheel，也不能把最新 Omni main 与 vLLM 0.30 混装。
 
-## 1. 源码开发
-
-在包含本次新增 `install.sh` 的 checkout 中：
+## 1. 当前源码：已实际安装验证
 
 ```bash
+cd /path/to/vllm-omni-metal
 ./install.sh
 source .venv-vllm-omni-metal/bin/activate
 vllm-omni --help
+python -m pip check
 ```
 
-此流程创建源码目录下 `.venv-vllm-omni-metal`、安装上述依赖，再 editable 安装当前目录。原有 `.venv` 不动。可指定新路径：
+默认创建当前 checkout 的 `.venv-vllm-omni-metal`，editable 安装当前插件。也可指定新的独立路径：
 
 ```bash
 ./install.sh --venv "$HOME/.venv-vllm-omni-metal"
-source "$HOME/.venv-vllm-omni-metal/bin/activate"
 ```
 
-安装器只接受新目录或它自己标记创建的环境，不接管任意既有 venv/Homebrew libexec，不使用 `--clear`。失败后保留自己创建的环境以便诊断和重试。更新前先停止使用该环境的服务，再运行安装器。
+安装器只接受新目录或它自己标记创建的环境，不接管任意已有 venv/Homebrew libexec，不使用 `--clear`。失败时保留环境和缓存供诊断、重试。依赖和插件在同一次 uv 解析中安装，保持 vllm-metal 声明的 mlx-lm Git URL 可见。
 
-已有项目开发 `.venv` 不需要迁移或重新下载依赖；它仍可使用原来的 `pip install --no-deps --no-build-isolation -e .` 和检查命令。
+更新一个已使用的环境前，先停止所有使用它的服务。本次安装使用新的独立环境，保留运行中的 Higgs 及旧 Homebrew 环境；没有自动迁移服务。
 
-## 2. Homebrew
+## 2. Homebrew：发布本次改动后
 
-`Formula/vllm-omni-metal.rb` 使用独立 `libexec`，安装所有配套依赖，仅链接 **`vllm-omni`**，不接管 `vllm-metal` 已有的 `vllm` 命令。采用上游 Formula 的 `preserve_rpath` 和 TVM-FFI/xgrammar RECORD 保留处理。
+本次 Formula、插件依赖和安装器更新尚未提交/推送。旧远端 Formula 仍不会自动变成 0.31。新 Formula **仅支持 HEAD**：旧 0.1.0 源码快照要求 0.30，不能作为新栈的稳定源码冒用；暂无匹配新栈的已发布插件 release。
 
-目前 Formula 和安装脚本是本地新增文件，尚未推送/发布。当前 checkout 可以创建本地 tap：
-
-```bash
-brew tap-new local/vllm-omni-metal
-cp Formula/vllm-omni-metal.rb \
-  "$(brew --repository)/Library/Taps/local/homebrew-vllm-omni-metal/Formula/"
-brew install local/vllm-omni-metal/vllm-omni-metal
-```
-
-本地 tap 名称若已存在，不重复 `tap-new`。不要安装到共享的 `$(brew --prefix vllm-metal)/libexec`。
-
-发布到远端仓库后才可使用：
+发布配套源码与 Formula 后：
 
 ```bash
 brew tap xiaoxiaoto/vllm-omni-metal https://github.com/xiaoxiaoto/vllm-omni-metal
-brew install xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
-vllm-omni --help
+brew update
+brew install --HEAD --build-from-source xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
 ```
 
-Formula 当前安装已发布的 `0.1.0` 源码快照，不假装存在尚未发布的插件 release wheel。固定源码 archive 与 native wheel 的 SHA256，Omni 源码也固定 commit。升级需要维护这组匹配版本及 checksum，不能简单改成 latest。
+已有安装切换新栈时，先停止共享该安装的服务，再运行：
 
-Python 位于 `$(brew --prefix vllm-omni-metal)/libexec/bin/python`。无需激活环境。移除使用 `brew uninstall vllm-omni-metal`；不要卸载仍被其他服务使用的 vllm-metal。
+```bash
+brew reinstall --HEAD --build-from-source xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
+brew test xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
+```
 
-## 3. curl 安装（脚本发布后）
+配方使用独立 `libexec`，仅链接 `vllm-omni`，不接管已有 `vllm`。保留 `preserve_rpath` 和 TVM-FFI/xgrammar RECORD。Python 位于 `$(brew --prefix vllm-omni-metal)/libexec/bin/python`，无需激活。
+
+不要只比较插件 HEAD 是否变化来判断依赖已升级。使用 Higgs 部署时，`docker-compose/higgs-tts-3/start.sh` 的版本检查已同步为 0.31 / Omni dev 快照；先发布、停止、重装，再启动，不能复用旧 0.30 栈。
+
+本次没有运行实际 `brew install/reinstall`，没有改 Homebrew libexec 或重启已有服务。
+
+## 3. curl：发布本次改动后
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xiaoxiaoto/vllm-omni-metal/main/install.sh | bash
 source ~/.venv-vllm-omni-metal/bin/activate
 ```
 
-没有 uv 时安装器使用上游同样的 uv bootstrap。无本地 checkout 时安装固定已发布源码 archive，不需要本项目 release wheel。默认环境为 `~/.venv-vllm-omni-metal`；当前远端还没有本次新脚本，因此此命令暂不能执行。
-
-删除该环境即可卸载；确认它仅由本安装器使用后再操作，不删除 Hugging Face / ModelScope 模型缓存或生成文件。
+无本地 checkout 时安装本插件 Git main；它与 Homebrew HEAD 一样是源码入口，不再使用要求 0.30 的旧插件 archive。native wheels 和 Omni commit 仍固定。没有 uv 时采用固定 uv bootstrap。远端 main 必须同时包含本次依赖与代码变更，当前未验证此远端入口。
 
 ## 使用与验证
 
 ```bash
-vllm-omni serve /path/to/local/checkpoint --omni \
+.venv-vllm-omni-metal/bin/vllm-omni serve /path/to/local/checkpoint --omni \
   --deploy-config /path/to/metal-resource-profile.yaml \
   --host 127.0.0.1 --port 18094
+
+VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q
 ```
 
-原生 AR/generation profile 需要 CUSTOM、单设备、同步调度及关闭 prefix cache，见 [通用后端协议](generic-backend.md)。安装入口不替换模型 topology 或注册表，也不启动服务。
+原生 profile 要求 CUSTOM、单设备、同步调度、关闭 prefix cache，见 [通用后端协议](generic-backend.md)。安装器不启动模型，不替换 registry、模型 topology 或请求语义。
 
-本次验证覆盖安装器命令/安全边界的 mock 回归、Formula Ruby 语法和 Homebrew DSL 加载、源码 archive checksum。**尚未进行联网全新安装或实际 `brew install`**，不能把已有开发环境的成功当成这些入口的端到端安装验证。
+本次从新环境完成真实联网解析/安装：`pip check`、版本与 MPS generator 校验、CLI `--help`、**72 passed / 1 skipped**。测试包括随机 Llama/Qwen3、tiny SD 和原生 generation 的真实 MPS 推理；跳过的是需显式提供大权重的 Higgs 验收。mock 安装回归另覆盖源码/curl 命令、安全边界、固定版本与 checksum 同步。
+
+YuE2 的模型级 MPS 障碍尚未修复；更新依赖不等于音乐生成可用，见 [接入状态](yue2-readiness.md)。PyAV/OpenCV/系统 FFmpeg 存在重复 Objective-C 类警告，本次 CLI 与测试可通过，但媒体视频路径未额外验收。
+
+卸载仅移除确认不再被服务使用的安装器环境或 `brew uninstall vllm-omni-metal`；不删除模型缓存、生成文件或仍被其他项目使用的 vllm-metal。

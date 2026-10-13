@@ -20,6 +20,7 @@ from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, sna
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.sampling_utils import call_model_sampler
+from vllm_omni.worker.sparse_audio import resolve_sparse_mm_req_ids
 
 from vllm_omni_metal.native_attention import MetalAttentionMetadata
 from vllm_omni_metal.native_compat import adapt_mps_capture_queries
@@ -302,6 +303,40 @@ class MetalNativeModelRunner(OmniConnectorModelRunnerMixin):
                         else:
                             info[i][key] = value
             inputs_embeds = torch.cat(embedding_rows, dim=0)
+        prepare = getattr(self.model, "prepare_runner_inputs", None)
+        if callable(prepare):
+            prepare_kwargs = dict(
+                req_ids=ids,
+                num_computed_tokens=[self.requests[rid].num_computed_tokens for rid in ids],
+                num_scheduled_tokens=[b - a for a, b in zip(starts[:-1], starts[1:], strict=True)],
+                input_ids=input_ids,
+                positions=position_ids,
+                inputs_embeds=inputs_embeds,
+                input_ids_buffer=input_ids,
+            )
+            if getattr(self.model, "accepts_runner_sampling_extra_args", False):
+                prepare_kwargs.update(
+                    sampling_extra_args=[
+                        self.requests[rid].sampling_params.extra_args or {} for rid in ids
+                    ],
+                    discard_mask=[
+                        lengths[i] < len(self.requests[rid].prompt_token_ids)
+                        for i, rid in enumerate(ids)
+                    ],
+                )
+            with set_current_vllm_config(self.vllm_config):
+                input_ids, position_ids = prepare(**prepare_kwargs)
+            if any(
+                not isinstance(tensor, torch.Tensor)
+                or tensor.shape != (len(tokens),)
+                or tensor.device.type != self.device.type
+                or (self.device.index is not None and tensor.device.index != self.device.index)
+                or tensor.dtype not in (torch.int32, torch.int64)
+                for tensor in (input_ids, position_ids)
+            ):
+                raise ValueError(
+                    "model prepare_runner_inputs changed scheduled token shape/device/dtype"
+                )
         kwargs = dict(
             input_ids=input_ids,
             positions=position_ids,
@@ -344,6 +379,10 @@ class MetalNativeModelRunner(OmniConnectorModelRunnerMixin):
                 hidden = output.text_hidden_states
             else:
                 hidden = output
+            make_output = getattr(self.model, "make_omni_output", None)
+            if callable(make_output) and not self.is_generation:
+                # Model-owned sampling may append terminal audio to this step's payload.
+                output = make_output(output, **kwargs)
             sampled = []
             if not self.is_generation:
                 sample_hidden = hidden[
@@ -392,31 +431,44 @@ class MetalNativeModelRunner(OmniConnectorModelRunnerMixin):
                             self.model_intermediate_buffer[rid].setdefault(key, {}).update(value)
                         else:
                             self.model_intermediate_buffer[rid][key] = value
-            make_output = getattr(self.model, "make_omni_output", None)
-            if callable(make_output) and not self.is_generation:
-                output = make_output(output, **kwargs)
         mm = output.multimodal_outputs if isinstance(output, OmniOutput) else None
+        sparse_ids = resolve_sparse_mm_req_ids(mm)
+        sparse = sparse_ids is not None
+        sparse_index = {rid: i for i, rid in enumerate(sparse_ids or [])}
+        if any(rid not in ids for rid in sparse_index):
+            raise ValueError("sparse multimodal output refers to an unscheduled request")
         flat_mm = flatten_payload(mm) if mm else {}
-        if flat_mm.get("meta.sparse_audio") is not None:
-            raise NotImplementedError("native Metal sparse multimodal routing is not yet supported")
+        if sparse:
+            for key, value in flat_mm.items():
+                if key not in ("meta.req_id", "meta.sparse_audio") and isinstance(value, list):
+                    if len(value) != len(sparse_ids):
+                        raise ValueError(
+                            "sparse multimodal payload length does not match request ids"
+                        )
         mm_cpu = build_mm_cpu(flat_mm)
         payloads = []
         for i, rid in enumerate(ids):
             begin, end = starts[i : i + 2]
-            payload = build_omni_mm_payload(
-                combined_multimodal_outputs=None,
-                mm_cpu=mm_cpu,
-                rid=rid,
-                idx=i,
-                start=begin,
-                end=end,
-                audio_sparse_output=False,
-                sparse_mm_index={},
-                hidden_seq_len=len(tokens),
-                scheduled_seq_len=len(tokens),
+            payload = (
+                {}
+                if sparse and rid not in sparse_index
+                else build_omni_mm_payload(
+                    combined_multimodal_outputs=None,
+                    mm_cpu=mm_cpu,
+                    rid=rid,
+                    idx=i,
+                    start=begin,
+                    end=end,
+                    audio_sparse_output=sparse,
+                    sparse_mm_index=sparse_index,
+                    hidden_seq_len=len(tokens),
+                    scheduled_seq_len=len(tokens),
+                )
             )
-            if not self.is_generation and getattr(
-                self.model, "omni_pooler_payload_include_hidden", True
+            if (
+                not sparse
+                and not self.is_generation
+                and getattr(self.model, "omni_pooler_payload_include_hidden", True)
             ):
                 payload["hidden_states"] = hidden[begin:end].detach().cpu().contiguous()
             payloads.append(snapshot_mm_payload(payload))

@@ -122,6 +122,132 @@ def test_payload_nonfinite_values_rejected_before_transport():
         MetalNativeModelRunner._validate_payload({"values": [torch.tensor([float("nan")])]})
 
 
+def test_prepare_runner_inputs_receives_request_local_sampling_and_discard_mask(runner):
+    class PreparedModel(PlainLanguageModel):
+        accepts_runner_sampling_extra_args = True
+
+        def prepare_runner_inputs(self, **kwargs):
+            self.prepared = kwargs
+            return kwargs["input_ids"], kwargs["positions"]
+
+    runner.model = PreparedModel()
+    runner.execute_model(make_output([request("a", [1, 2, 3], extra_args={"seed": 83})], {"a": 2}))
+    assert runner.model.prepared["sampling_extra_args"] == [{"seed": 83}]
+    assert runner.model.prepared["discard_mask"] == [True]
+    runner.execute_model(make_output(counts={"a": 1}, cached=["a"], computed=[2]))
+    assert runner.model.prepared["num_computed_tokens"] == [2]
+    assert runner.model.prepared["discard_mask"] == [False]
+
+
+def test_prepare_runner_inputs_cannot_change_scheduled_shape(runner):
+    class InvalidModel(PlainLanguageModel):
+        def prepare_runner_inputs(self, **kwargs):
+            return kwargs["input_ids"][:0], kwargs["positions"]
+
+    runner.model = InvalidModel()
+    with pytest.raises(ValueError, match="scheduled token shape"):
+        runner.execute_model(make_output([request("a", [1])], {"a": 1}))
+
+
+class SparseModel(PlainLanguageModel):
+    prefer_model_sampler = True
+
+    def make_omni_output(self, output, **kwargs):
+        from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+        self.payload = {
+            "model_outputs": [],
+            "sr": torch.tensor([48000]),
+            "meta": {"req_id": [], "sparse_audio": ["1"]},
+        }
+        return OmniOutput(text_hidden_states=output, multimodal_outputs=self.payload)
+
+    def sample(self, logits, sampling_metadata):
+        from vllm.v1.outputs import SamplerOutput
+
+        # Reverse sparse order; batch indexing must not swap audio between requests.
+        self.payload["meta"]["req_id"] = ["b", "a"]
+        self.payload["model_outputs"] = [torch.tensor([7.0]), torch.tensor([2.0])]
+        return SamplerOutput(sampled_token_ids=logits.argmax(-1)[:, None], logprobs_tensors=None)
+
+
+def test_terminal_audio_from_model_sampler_is_routed_by_request_id(runner):
+    runner.model = SparseModel()
+    result = runner.execute_model(
+        make_output([request("a", [1]), request("b", [6])], {"a": 1, "b": 1})
+    )
+    payloads = result.inter_stage_outputs
+    assert payloads[0]["model_outputs"].tolist() == [2.0]
+    assert payloads[1]["model_outputs"].tolist() == [7.0]
+    assert all("hidden_states" not in payload for payload in payloads)
+
+
+@pytest.mark.parametrize("case", ["empty", "subset", "duplicate", "unknown", "length", "marker"])
+def test_sparse_output_validation_and_empty_steps(runner, case):
+    class SparseCase(SparseModel):
+        def sample(self, logits, sampling_metadata):
+            result = super().sample(logits, sampling_metadata)
+            meta = self.payload["meta"]
+            if case == "empty":
+                meta["req_id"] = []
+                self.payload["model_outputs"] = []
+            elif case == "subset":
+                meta["req_id"] = ["b"]
+                self.payload["model_outputs"] = [torch.tensor([7.0])]
+            elif case == "duplicate":
+                meta["req_id"] = ["b", "b"]
+            elif case == "unknown":
+                meta["req_id"] = ["b", "other"]
+            elif case == "length":
+                self.payload["model_outputs"] = []
+            elif case == "marker":
+                meta["sparse_audio"] = torch.tensor(1)
+            return result
+
+    runner.model = SparseCase()
+    scheduled = make_output([request("a", [1]), request("b", [6])], {"a": 1, "b": 1})
+    if case in ("empty", "subset"):
+        output = runner.execute_model(scheduled)
+        assert output.inter_stage_outputs[0] == {}
+        if case == "empty":
+            assert output.inter_stage_outputs[1] == {}
+        else:
+            assert output.inter_stage_outputs[1]["model_outputs"].tolist() == [7.0]
+    else:
+        with pytest.raises(ValueError):
+            runner.execute_model(scheduled)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.getenv("VLLM_OMNI_METAL_INTEGRATION") != "1" or not is_available(),
+    reason="requires Apple Silicon and explicit integration opt-in",
+)
+def test_prepare_and_sparse_sampler_on_default_mps_device(runner):
+    class PreparedSparseModel(SparseModel):
+        accepts_runner_sampling_extra_args = True
+
+        def prepare_runner_inputs(self, **kwargs):
+            assert kwargs["input_ids"].device.type == "mps"
+            assert kwargs["sampling_extra_args"] == [{"seed": 83}, {"seed": 42}]
+            return kwargs["input_ids"], kwargs["positions"]
+
+    runner.device = torch.device("mps")
+    runner.model = PreparedSparseModel()
+    result = runner.execute_model(
+        make_output(
+            [
+                request("a", [1], extra_args={"seed": 83}),
+                request("b", [6], extra_args={"seed": 42}),
+            ],
+            {"a": 1, "b": 1},
+        )
+    )
+    assert result.sampled_token_ids == [[2], [7]]
+    assert result.inter_stage_outputs[0]["model_outputs"].tolist() == [2.0]
+    assert result.inter_stage_outputs[1]["model_outputs"].tolist() == [7.0]
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     os.getenv("VLLM_OMNI_METAL_INTEGRATION") != "1" or not is_available(),

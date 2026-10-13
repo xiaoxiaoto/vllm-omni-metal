@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-# Match the tested 0.30.0 stack, not upstream's moving development channel.
-vllm_url='https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl#sha256=fd9adfd566a8afa4ecbdf36b04bab10ebf43cd9ca18eca4b0a0bf2013b8de135'
-metal_url='https://github.com/vllm-project/vllm-metal/releases/download/v0.30.0/vllm_metal-0.30.0-cp312-cp312-macosx_15_0_arm64.whl#sha256=3955de8b2c75b633ef889b70fa469a4db661a0c5bb2f78e36272d68b16da9353'
-omni_source='vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@a8576ccb725c4e21cd13c3eb5f9a546b21149d2b'
-plugin_url='https://codeload.github.com/xiaoxiaoto/vllm-omni-metal/tar.gz/81a8a7e30cc5cd7f2e41f3aabf5dd9d710f218b0#sha256=ee68d7b122ccb2934e571b5041ee493aca12382eabb95fc43a8cd2a797b3cca6'
+# Match stable 0.31 native wheels with a frozen Omni main snapshot.
+vllm_url='https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl#sha256=21378516a51ff15029f71168e827b94660e21b39484eb52277166f01ac7dd686'
+metal_url='https://github.com/vllm-project/vllm-metal/releases/download/v0.31.0/vllm_metal-0.31.0-cp312-cp312-macosx_15_0_arm64.whl#sha256=e2ab31296f8c42d8b65c8d5f5490f160087d1070178444870a5672e44aaacf6e'
+omni_source='vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@2ec5f265c69520cdd5e5f0a19db485d38885843e'
+plugin_url='vllm-omni-metal @ git+https://github.com/xiaoxiaoto/vllm-omni-metal.git@main'
 
 source_dir=''
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
       venv="$2"; shift 2 ;;
     -h|--help)
       printf '%s\n' '用法：install.sh [--venv PATH]' \
-        '安装匹配的 vLLM CPU / vllm-metal 0.30.0 wheel、Omni CPU 包和本插件。' \
+        '安装匹配的 vLLM CPU / vllm-metal 0.31.0 wheel、Omni CPU 包和本插件。' \
         '源码运行默认创建 .venv-vllm-omni-metal（editable）；curl 运行创建 ~/.venv-vllm-omni-metal。' \
         '不修改系统 Python、Homebrew libexec、已有 .venv 或运行中的服务。'
       exit 0 ;;
@@ -68,21 +68,22 @@ assert platform.machine() == 'arm64', 'Python 必须是原生 arm64'
 assert sys.prefix != sys.base_prefix, '拒绝安装到系统 Python'
 PY
 # Omni's actual selector is VLLM_OMNI_TARGET_DEVICE, not VLLM_TARGET_DEVICE.
-export VLLM_OMNI_TARGET_DEVICE=cpu VLLM_OMNI_VERSION_OVERRIDE=0.30.0+cpu
-uv pip install --python "$python" "$vllm_url" "$metal_url" "$omni_source"
+export VLLM_OMNI_TARGET_DEVICE=cpu VLLM_OMNI_VERSION_OVERRIDE=0.31.0.dev0+cpu
 if [[ -n "$source_dir" ]]; then
-  uv pip install --python "$python" -e "$source_dir"
+  plugin_args=(-e "$source_dir")
 else
-  uv pip install --python "$python" "$plugin_url"
+  plugin_args=("$plugin_url")
 fi
+# Keep the native wheel's Git dependencies visible in the same resolution.
+uv pip install --python "$python" "$vllm_url" "$metal_url" "$omni_source" "${plugin_args[@]}"
 uv pip check --python "$python"
 "$python" - <<'PY'
 from importlib.metadata import entry_points, version
 import torch
 from vllm_omni_metal import is_available
-assert version('vllm') == '0.30.0+cpu'
-assert version('vllm-metal') == '0.30.0'
-assert version('vllm-omni') == '0.30.0+cpu'
+assert version('vllm') == '0.31.0+cpu'
+assert version('vllm-metal') == '0.31.0'
+assert version('vllm-omni') == '0.31.0.dev0+cpu'
 assert is_available(), 'MPS 不可用'
 assert torch.Generator(device='mps') is not None
 assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'

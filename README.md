@@ -17,13 +17,28 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 原生 Higgs 验收使用上游 Talker → Code2Wav，**不是 mlx-audio 融合 facade**。语音接口返回 24 kHz、3.08 秒有限非静音 PCM16 WAV，同 seed 输出字节一致；这不等于听感或内容准确率评估通过。
 
-**通用执行后端不等于所有 Omni 模型和功能都已移植。** 当前原生路径限单 MPS 设备、`uni`、同步调度、未量化 dense decoder attention。encoder multimodal 输入、prompt embeddings、auxiliary Talker MTP、稀疏 multimodal 路由、prefix/model-state caching、logprobs、structured decoding、LoRA、跨引擎 KV、睡眠和 offload 未支持。CUDA/Triton 专用模型算子仍需独立移植；不自动 CPU fallback。
+**通用执行后端不等于所有 Omni 模型和功能都已移植。** 当前原生路径限单 MPS 设备、`uni`、同步调度、未量化 dense decoder attention。encoder multimodal 输入、prompt embeddings、auxiliary Talker MTP、prefix/model-state caching、logprobs、structured decoding、LoRA、跨引擎 KV、睡眠和 offload 未支持。CUDA/Triton 专用模型算子仍需独立移植；不自动 CPU fallback。
+
+原生 runner 已支持通用 `prepare_runner_inputs`（含 opt-in 请求级采样参数）、采样期间追加终结输出，以及按请求 ID 路由的稀疏音频输出。稀疏协议的非法 marker、重复/未知 ID 和列表长度不一致均拒绝传输；无输出的请求不会收到其他请求的音频或 hidden states。
+
+**YuE2 尚未完成端到端 Metal 支持。** 最新 Omni 有原生实现，但其模型采样仍有 CPU generator/MPS 张量不匹配和 CUDA pinned-memory/event 假设；这些修复属于上游模型，不在本插件硬编码。兼容性核对、实际测试及版本升级边界见 [YuE2 接入状态](docs/yue2-readiness.md)。安装入口已升级到 0.31 native wheels + 固定 Omni main 快照，Omni 明确标为开发版，不把它伪装成稳定 release。
 
 ## 环境与安装
 
 参考 [vllm-metal 安装方式](https://github.com/vllm-project/vllm-metal/blob/main/docs/installation.md)：**独立 Python 环境 + 预编译 macOS arm64 wheel**，不把 Omni 追加到已有 vllm-metal 的 Homebrew 私有环境。
 
-需要 Apple Silicon、**macOS 15+**、原生 Python 3.12。安装器固定已验证的 vLLM / vllm-metal / Omni 0.30.0、PyTorch 2.13 CPU/MPS 组合，不追踪上游 0.31/latest，不下载模型。无需编译本项目或 vllm-metal 的原生 kernel；Omni CPU Python 包从固定上游源码构建。
+需要 Apple Silicon、**macOS 15+**、原生 Python 3.12。当前固定栈：
+
+| 项目 | 安装版本 |
+| --- | --- |
+| vLLM | 最新稳定 `0.31.0+cpu`，官方 macOS arm64 wheel |
+| vllm-metal | 最新稳定 `0.31.0`，官方 macOS arm64 wheel |
+| vLLM-Omni | main `2ec5f265c69520cdd5e5f0a19db485d38885843e`，标记 `0.31.0.dev0+cpu` |
+| PyTorch / Transformers | 本次完整安装为 `2.13.0` / `5.14.1` |
+
+Omni 最新稳定 tag 仍为 0.30；需要 YuE2 等新集成时使用上述固定 main 快照，不能与 0.30 vLLM wheel 混装。native wheel 固定 SHA256，Omni 固定 commit，不在每次启动时自动追踪最新依赖，不下载模型。无需编译本项目或 vllm-metal 的原生 kernel。
+
+已在独立 `.venv-vllm-omni-metal` 完整安装并通过依赖检查、CLI 和 **72 项测试**（含真实 MPS 的随机 Llama/Qwen3、tiny SD 及原生 generation pipeline）；真实 Higgs 大权重验收未在新栈重跑，YuE2 音乐生成仍未通过。
 
 ### 源码安装（当前 checkout 可用）
 
@@ -38,11 +53,11 @@ vllm-omni --help
 
 ### Homebrew 与 curl
 
-已提供 `Formula/vllm-omni-metal.rb` 和支持 `curl | bash` 的安装器。**当前新增文件尚未发布到远端，不能假称 tap/curl 命令已经可用**。现有 checkout 可按 [安装指南](docs/installation.md) 的本地 tap 步骤使用 Formula；文件发布后：
+已提供 `Formula/vllm-omni-metal.rb` 和支持 `curl | bash` 的安装器。**本次 0.31 升级尚未发布到远端，远端 tap/curl 不会自动包含本地改动**；发布 Formula、安装器和插件源码后：
 
 ```bash
 brew tap xiaoxiaoto/vllm-omni-metal https://github.com/xiaoxiaoto/vllm-omni-metal
-brew install xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
+brew install --HEAD --build-from-source xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
 vllm-omni --help  # Homebrew libexec，不必激活环境，也不覆盖 vllm 命令
 
 # 或安装到 ~/.venv-vllm-omni-metal，再激活：
@@ -50,9 +65,11 @@ curl -fsSL https://raw.githubusercontent.com/xiaoxiaoto/vllm-omni-metal/main/ins
 source ~/.venv-vllm-omni-metal/bin/activate
 ```
 
+Formula 暂仅支持 HEAD：旧 `0.1.0` 稳定源码快照要求 0.30，不能与新栈混装。curl 模式安装本插件 main，源码模式 editable 安装当前目录；native wheels 和 Omni commit 始终固定。已有 Homebrew 安装在停止所有共享服务后用 `brew reinstall --HEAD --build-from-source` 切换新配方；仅看插件 commit 是否变化不足以确认依赖已经升级。
+
 平台通过 `vllm_omni.platform_plugins` 自动发现。若设置 `VLLM_PLUGINS`，保留 `metal` 和上游所需插件（如 `vllm_omni_register_models`）。不需要本项目的 general-plugin 注册函数。
 
-Omni 构建使用 **`VLLM_OMNI_TARGET_DEVICE=cpu`**，不是 `VLLM_TARGET_DEVICE`。默认进程启动方式为 `spawn`；不要 fork 已初始化的 Metal/Objective-C。服务运行安装环境的 `vllm-omni`，不是基础 `vllm`。已有开发 `.venv` 的检查命令保持如下；其他安装环境替换相应路径。
+Omni 构建使用 **`VLLM_OMNI_TARGET_DEVICE=cpu`**，不是 `VLLM_TARGET_DEVICE`。默认进程启动方式为 `spawn`；不要 fork 已初始化的 Metal/Objective-C。服务运行安装环境的 `vllm-omni`，不是基础 `vllm`。原有 `.venv` 不动；以下命令使用本次完整安装的 `.venv-vllm-omni-metal`，其他环境替换路径。
 
 ## 原生多阶段使用
 
@@ -70,7 +87,7 @@ gpu_memory_utilization: 0.3
 保留模型自己的 stage IDs、执行类型、connectors、stage processors 和采样参数。不要直接照搬含 FLASHINFER / prefix caching 的 CUDA 高吞吐 profile；`CUSTOM` 对应本插件的 MPS SDPA，不是 Torch Diffusers 的 `TORCH_SDPA` 名称。
 
 ```bash
-.venv/bin/vllm-omni serve /path/to/local/checkpoint --omni \
+.venv-vllm-omni-metal/bin/vllm-omni serve /path/to/local/checkpoint --omni \
   --deploy-config /path/to/metal-resource-profile.yaml \
   --host 127.0.0.1 --port 18094
 ```
@@ -80,7 +97,7 @@ gpu_memory_utilization: 0.3
 ## Diffusers 示例
 
 ```bash
-.venv/bin/python examples/generate_image.py \
+.venv-vllm-omni-metal/bin/python examples/generate_image.py \
   --model hf-internal-testing/tiny-stable-diffusion-pipe \
   --prompt 'a small red robot' --steps 2 --width 64 --height 64 \
   --output outputs/robot.png
@@ -93,19 +110,19 @@ gpu_memory_utilization: 0.3
 ## 检查与验收
 
 ```bash
-.venv/bin/python -m pytest -q -m 'not integration'
-.venv/bin/ruff check .
-.venv/bin/ruff format --check .
+.venv-vllm-omni-metal/bin/python -m pytest -q -m 'not integration'
+.venv-vllm-omni-metal/bin/ruff check .
+.venv-vllm-omni-metal/bin/ruff format --check .
 
 # 本地随机模型：图像、完整 pipeline、Llama 和 Qwen3；无需下载。
-VLLM_OMNI_METAL_INTEGRATION=1 .venv/bin/python -m pytest -q
+VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q
 
 # 加入已有本地原生 Higgs checkpoint；HTTP 真正生成音频并检查 seed。
 VLLM_OMNI_METAL_INTEGRATION=1 \
 VLLM_OMNI_METAL_NATIVE_MODEL=/path/to/local/higgs-checkpoint \
-  .venv/bin/python -m pytest -q
+  .venv-vllm-omni-metal/bin/python -m pytest -q
 
-.venv/bin/python -m pip wheel --no-deps --no-build-isolation -w dist .
+.venv-vllm-omni-metal/bin/python -m pip wheel --no-deps --no-build-isolation -w dist .
 ```
 
 测试涵盖不连续物理页、增量 causal offset、GQA、请求隔离、标准模型签名、采样约束、pre/postprocess、hidden-state 输出、配置/内存边界，以及 macOS shared-memory 的长名字、帧长度、锁和资源清理。

@@ -4,10 +4,7 @@ require "uri"
 class VllmOmniMetal < Formula
   desc "Native multi-stage vLLM-Omni inference on Apple Silicon"
   homepage "https://github.com/xiaoxiaoto/vllm-omni-metal"
-  # The current published source snapshot; no release wheel is advertised yet.
-  url "https://codeload.github.com/xiaoxiaoto/vllm-omni-metal/tar.gz/81a8a7e30cc5cd7f2e41f3aabf5dd9d710f218b0"
-  version "0.1.0"
-  sha256 "ee68d7b122ccb2934e571b5041ee493aca12382eabb95fc43a8cd2a797b3cca6"
+  # No published plugin release matches the 0.31 stack yet; install HEAD.
   license "Apache-2.0"
   head "https://github.com/xiaoxiaoto/vllm-omni-metal.git", branch: "main"
 
@@ -19,15 +16,15 @@ class VllmOmniMetal < Formula
   preserve_rpath
 
   resource "vllm" do
-    url "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl",
+    url "https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl",
         using: :nounzip
-    sha256 "fd9adfd566a8afa4ecbdf36b04bab10ebf43cd9ca18eca4b0a0bf2013b8de135"
+    sha256 "21378516a51ff15029f71168e827b94660e21b39484eb52277166f01ac7dd686"
   end
 
   resource "vllm-metal" do
-    url "https://github.com/vllm-project/vllm-metal/releases/download/v0.30.0/vllm_metal-0.30.0-cp312-cp312-macosx_15_0_arm64.whl",
+    url "https://github.com/vllm-project/vllm-metal/releases/download/v0.31.0/vllm_metal-0.31.0-cp312-cp312-macosx_15_0_arm64.whl",
         using: :nounzip
-    sha256 "3955de8b2c75b633ef889b70fa469a4db661a0c5bb2f78e36272d68b16da9353"
+    sha256 "e2ab31296f8c42d8b65c8d5f5490f160087d1070178444870a5672e44aaacf6e"
   end
 
   def install
@@ -38,9 +35,9 @@ class VllmOmniMetal < Formula
       cp resource(name).cached_download, wheel
       wheel
     end
-    with_env(VLLM_OMNI_TARGET_DEVICE: "cpu", VLLM_OMNI_VERSION_OVERRIDE: "0.30.0+cpu") do
+    with_env(VLLM_OMNI_TARGET_DEVICE: "cpu", VLLM_OMNI_VERSION_OVERRIDE: "0.31.0.dev0+cpu") do
       system libexec/"bin/pip", "install", *wheels,
-             "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@a8576ccb725c4e21cd13c3eb5f9a546b21149d2b",
+             "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@2ec5f265c69520cdd5e5f0a19db485d38885843e",
              buildpath
     end
     system libexec/"bin/pip", "check"
@@ -78,9 +75,9 @@ class VllmOmniMetal < Formula
       from importlib.metadata import entry_points, version
       import torch
       from vllm_omni_metal import is_available
-      assert version('vllm') == '0.30.0+cpu'
-      assert version('vllm-metal') == '0.30.0'
-      assert version('vllm-omni') == '0.30.0+cpu'
+      assert version('vllm') == '0.31.0+cpu'
+      assert version('vllm-metal') == '0.31.0'
+      assert version('vllm-omni') == '0.31.0.dev0+cpu'
       assert is_available()
       assert torch.Generator(device='mps') is not None
       assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'
