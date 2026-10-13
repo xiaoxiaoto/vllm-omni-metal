@@ -12,7 +12,9 @@
 
 从项目根目录运行，优先使用现有 `.venv`。实测基线是 Python 3.12、vllm-metal / vLLM / vLLM-Omni 0.30.0、PyTorch 2.13、diffusers 0.40.0。原生 seeded 采样依赖 MPS generator。不要未经验证升级依赖或以 CUDA wheel 覆盖 macOS 的 vLLM CPU 构建。
 
-以下安装命令仅适用于配套依赖和构建工具已经准备好的环境：
+项目安装参考 vllm-metal：`install.sh` 创建独立 `.venv-vllm-omni-metal`（本地源码 editable）或 `~/.venv-vllm-omni-metal`（curl）；`Formula/vllm-omni-metal.rb` 创建 Homebrew libexec 并只链接 `vllm-omni`。查看 `docs/installation.md`；不把 Omni 装入已有 vllm-metal 共享环境。安装时固定 CPU/MPS 0.30.0 栈，Omni 构建变量是 `VLLM_OMNI_TARGET_DEVICE=cpu`。变更版本/commit/checksum 时同步 Formula、脚本及安装测试；未经完整安装验证，不宣称新入口端到端可用或已发布。
+
+以下命令仅适用于配套依赖和构建工具已经准备好的既有开发 `.venv`：
 
 ```bash
 .venv/bin/python -m pip install --no-deps --no-build-isolation -e .
@@ -26,7 +28,7 @@
 .venv/bin/python -m pip wheel --no-deps --no-build-isolation -w dist .
 ```
 
-服务使用 `.venv/bin/vllm-omni`，不要误用 Homebrew 的基础 `vllm`。元数据/entry point 修改后重新 editable 安装；构建前清理过期 build 产物，防止已删除模块残留在 wheel。
+服务使用选定独立环境的 `vllm-omni`（Homebrew、安装器 venv 或开发 `.venv`），不要误用 Homebrew 的基础 `vllm`。元数据/entry point 修改后重新 editable 安装；构建前清理过期 build 产物，防止已删除模块残留在 wheel。
 
 ## 架构约束
 
@@ -52,7 +54,7 @@
 - 非平凡逻辑与缺陷修复补充小型回归测试；保留验证、错误处理和精度要求。
 - 注释只解释必要原因；暂时限制使用 `shortcut: <限制>, <升级条件>`。
 
-单元测试覆盖 platform/runtime/native worker/runner/attention/compat/SHM；GPU 回归覆盖 `tests/test_integration.py`、`tests/test_runtime.py`、`tests/test_native_runner.py`（随机 Llama/Qwen3）和 `tests/test_native_integration.py`（上游原生 Higgs HTTP）。修改注册、worker 或兼容补丁时运行全部非集成测试；保持注册不改写上游模型映射的检查。
+单元测试覆盖安装器命令/安全边界、platform/runtime/native worker/runner/attention/compat/SHM；GPU 回归覆盖 `tests/test_integration.py`、`tests/test_runtime.py`、`tests/test_native_runner.py`（随机 Llama/Qwen3）和 `tests/test_native_integration.py`（上游原生 Higgs HTTP）。修改注册、worker 或兼容补丁时运行全部非集成测试；保持注册不改写上游模型映射的检查。
 
 以下真机测试仅在用户授权且内存充足时运行，使用本地随机权重，无需下载：
 

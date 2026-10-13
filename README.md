@@ -21,18 +21,38 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 ## 环境与安装
 
-实测：Apple Silicon、Python 3.12、vllm-metal / vLLM / vLLM-Omni 0.30.0、PyTorch 2.13、diffusers 0.40.0。原生采样使用 PyTorch 2.13 的 MPS generator；BF16 需要 macOS 14+。不要盲目升级到上游 main / 0.31。
+参考 [vllm-metal 安装方式](https://github.com/vllm-project/vllm-metal/blob/main/docs/installation.md)：**独立 Python 环境 + 预编译 macOS arm64 wheel**，不把 Omni 追加到已有 vllm-metal 的 Homebrew 私有环境。
 
-先按 vllm-metal 说明安装匹配的 vLLM CPU 构建，以 `VLLM_TARGET_DEVICE=cpu` 安装同版本 Omni；PyPI CUDA wheel 不是 macOS 方案。在已准备好的项目环境中：
+需要 Apple Silicon、**macOS 15+**、原生 Python 3.12。安装器固定已验证的 vLLM / vllm-metal / Omni 0.30.0、PyTorch 2.13 CPU/MPS 组合，不追踪上游 0.31/latest，不下载模型。无需编译本项目或 vllm-metal 的原生 kernel；Omni CPU Python 包从固定上游源码构建。
+
+### 源码安装（当前 checkout 可用）
 
 ```bash
-.venv/bin/python -m pip install --no-deps --no-build-isolation -e .
-.venv/bin/python -m pip check
+cd /path/to/vllm-omni-metal  # 包含本次新增 install.sh 的 checkout
+./install.sh
+source .venv-vllm-omni-metal/bin/activate
+vllm-omni --help
+```
+
+默认创建源码目录中的 `.venv-vllm-omni-metal` 并 editable 安装；可用 `./install.sh --venv /absolute/path/to/new-env` 指定独立环境。原有开发 `.venv` 保持不变。
+
+### Homebrew 与 curl
+
+已提供 `Formula/vllm-omni-metal.rb` 和支持 `curl | bash` 的安装器。**当前新增文件尚未发布到远端，不能假称 tap/curl 命令已经可用**。现有 checkout 可按 [安装指南](docs/installation.md) 的本地 tap 步骤使用 Formula；文件发布后：
+
+```bash
+brew tap xiaoxiaoto/vllm-omni-metal https://github.com/xiaoxiaoto/vllm-omni-metal
+brew install xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
+vllm-omni --help  # Homebrew libexec，不必激活环境，也不覆盖 vllm 命令
+
+# 或安装到 ~/.venv-vllm-omni-metal，再激活：
+curl -fsSL https://raw.githubusercontent.com/xiaoxiaoto/vllm-omni-metal/main/install.sh | bash
+source ~/.venv-vllm-omni-metal/bin/activate
 ```
 
 平台通过 `vllm_omni.platform_plugins` 自动发现。若设置 `VLLM_PLUGINS`，保留 `metal` 和上游所需插件（如 `vllm_omni_register_models`）。不需要本项目的 general-plugin 注册函数。
 
-默认进程启动方式为 `spawn`；不要 fork 已初始化的 Metal/Objective-C。CLI 使用 `.venv/bin/vllm-omni`，不是 Homebrew 的基础 `vllm`。
+Omni 构建使用 **`VLLM_OMNI_TARGET_DEVICE=cpu`**，不是 `VLLM_TARGET_DEVICE`。默认进程启动方式为 `spawn`；不要 fork 已初始化的 Metal/Objective-C。服务运行安装环境的 `vllm-omni`，不是基础 `vllm`。已有开发 `.venv` 的检查命令保持如下；其他安装环境替换相应路径。
 
 ## 原生多阶段使用
 

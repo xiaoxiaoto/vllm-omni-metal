@@ -1,4 +1,5 @@
 .venv/
+.venv-vllm-omni-metal/
 __pycache__/
 *.py[cod]
 *.egg-info/
