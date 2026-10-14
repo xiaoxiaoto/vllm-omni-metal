@@ -7,6 +7,7 @@
 - 原生 Apple Silicon、macOS **15+**，不支持 Rosetta。
 - vLLM **0.31.0+cpu** 和 vllm-metal **0.31.0**（本次核对的最新稳定版），官方预编译 wheel，SHA256 固定在 Formula 和安装器。
 - Omni 最新稳定 tag 仍为 0.30.0。为使用 YuE2 等新集成，固定 main **`2ec5f265c69520cdd5e5f0a19db485d38885843e`**，构建为 **`0.31.0.dev0+cpu`**，明确是开发快照，不冒充稳定 release。
+- 插件版本为 **`0.31.0.dev0`**，跟随固定 Omni 的公开版本；`+cpu` 仅为 Omni 构建标记。后续升级须同步插件元数据、源码回退版本及 Omni 依赖，安装器和 Formula 测试会校验版本一致。
 - 构建设置 `VLLM_OMNI_TARGET_DEVICE=cpu` 和 `VLLM_OMNI_VERSION_OVERRIDE=0.31.0.dev0+cpu`；前者不是 `VLLM_TARGET_DEVICE`。
 - 本次完整解析得到 PyTorch 2.13.0、Transformers 5.14.1、MLX 0.32.1、diffusers 0.40.0。Omni 限定 Transformers `>=5.13,<5.15`；不能绕过这些约束只升级某个包。
 

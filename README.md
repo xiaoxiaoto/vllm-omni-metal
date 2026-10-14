@@ -34,6 +34,7 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 | vLLM | 最新稳定 `0.31.0+cpu`，官方 macOS arm64 wheel |
 | vllm-metal | 最新稳定 `0.31.0`，官方 macOS arm64 wheel |
 | vLLM-Omni | main `2ec5f265c69520cdd5e5f0a19db485d38885843e`，标记 `0.31.0.dev0+cpu` |
+| vllm-omni-metal | `0.31.0.dev0`，与固定 Omni 的公开版本一致（不含 `+cpu` 构建标记） |
 | PyTorch / Transformers | 本次完整安装为 `2.13.0` / `5.14.1` |
 
 Omni 最新稳定 tag 仍为 0.30；需要 YuE2 等新集成时使用上述固定 main 快照，不能与 0.30 vLLM wheel 混装。native wheel 固定 SHA256，Omni 固定 commit，不在每次启动时自动追踪最新依赖，不下载模型。无需编译本项目或 vllm-metal 的原生 kernel。

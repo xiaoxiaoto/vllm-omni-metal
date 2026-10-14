@@ -3,9 +3,11 @@
 
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tomllib
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 import pytest
@@ -116,6 +118,18 @@ def test_failed_dependency_install_stops_before_plugin_and_is_retryable(installe
     assert run("--venv", str(venv)).returncode == 0
 
 
+def test_plugin_version_matches_omni_and_source_fallback(monkeypatch):
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    assert f"vllm-omni=={project['version']}" in project["dependencies"]
+
+    def missing_package(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr("importlib.metadata.version", missing_package)
+    source = runpy.run_path(str(ROOT / "vllm_omni_metal/__init__.py"))
+    assert source["__version__"] == project["version"]
+
+
 def test_formula_and_script_pins_match():
     script = (ROOT / "install.sh").read_text()
     formula = (ROOT / "Formula/vllm-omni-metal.rb").read_text()
@@ -126,6 +140,8 @@ def test_formula_and_script_pins_match():
         "0.31.0.dev0+cpu",
     ):
         assert pin in script and pin in formula
+    version_check = "assert version('vllm-omni-metal') == version('vllm-omni').split('+', 1)[0]"
+    assert version_check in script and version_check in formula
     dependencies = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
     assert any(item.startswith("vllm==0.31.0;") for item in dependencies)
     assert any(item.startswith("vllm-metal==0.31.0;") for item in dependencies)

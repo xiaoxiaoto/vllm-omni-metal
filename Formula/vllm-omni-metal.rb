@@ -78,6 +78,7 @@ class VllmOmniMetal < Formula
       assert version('vllm') == '0.31.0+cpu'
       assert version('vllm-metal') == '0.31.0'
       assert version('vllm-omni') == '0.31.0.dev0+cpu'
+      assert version('vllm-omni-metal') == version('vllm-omni').split('+', 1)[0]
       assert is_available()
       assert torch.Generator(device='mps') is not None
       assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'

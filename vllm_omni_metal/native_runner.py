@@ -17,6 +17,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, snapshot_mm_payload
+from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.sampling_utils import call_model_sampler
@@ -73,6 +74,14 @@ class MetalNativeModelRunner(OmniConnectorModelRunnerMixin):
         inter_stage, multimodal = (
             partition_payload_list(payloads) if self._async_chunk else (payloads, payloads)
         )
+        # Only the client wire field is tensor-only; preserve inter-stage payload types.
+        if multimodal is not None:
+            multimodal = [
+                _ensure_tensor_values(payload) if payload is not None else None
+                for payload in multimodal
+            ]
+            for payload in multimodal:
+                self._validate_payload(payload)
         result = OmniModelRunnerOutput(
             req_ids=ids,
             req_id_to_index={rid: i for i, rid in enumerate(ids)},
