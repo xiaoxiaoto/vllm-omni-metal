@@ -9,6 +9,8 @@ from vllm.distributed import ensure_model_parallel_initialized, init_distributed
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
+# WorkerBase installs the configured IR priorities in each freshly spawned worker.
+import vllm_omni_metal.normalization  # noqa: F401
 from vllm_omni_metal.native_runner import MetalNativeModelRunner
 from vllm_omni_metal.platform import MetalOmniPlatform
 

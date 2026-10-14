@@ -37,6 +37,16 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 Apple M4 Pro、BF16、batch=4、context=2048、Q/KV heads=16/4、head size=128，20 次同步计时中位数：旧 gather+SDPA **5.956 ms**，上游分页算子 **0.512 ms**，约 **11.6×**。这是指定形状的算子端到端微基准，不是模型吞吐或所有输入的加速承诺；真实 Higgs 大权重未在新路径重跑。
 
+第二阶段已接入通用 **RMSNorm / 残差归一化**：移植上游已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的小型 IR adapter，调用 PyTorch 已有的融合 MPS RMSNorm，不写新 kernel、不升级依赖。原生 Metal worker 的 FP16/BF16、同 dtype/device 的一维 learned weight、完整 variance 默认选择 `omni_mps`；FP32、无 weight、variance override 或其他合法不匹配参数保留上游 `native`（MPS 输入仍在 MPS）。用户显式 IR 优先级保持优先，普通 LLM 配置不受影响。
+
+残差路径保留 **FP32 相加、未舍入 sum 的 variance、归一化先 cast 再乘 learned weight**；它仍包含独立加法等操作，**不是 add+RMSNorm 单 kernel 全融合**。随机 BF16 Llama/Qwen3 已检查 greedy 对照与 seed 隔离。
+
+```bash
+.venv-vllm-omni-metal/bin/python examples/benchmark_normalization.py --require-speedup
+```
+
+Apple M4 Pro、BF16、4×4096、30 次同步计时：普通 RMSNorm 0.182 → 0.152 ms（1.19×），残差归一化 0.191 → 0.170 ms（1.12×）。这是一次指定形状的算子微基准，不代表整模型吞吐；复现会有负载波动。
+
 ## 环境与安装
 
 参考 [vllm-metal 安装方式](https://github.com/vllm-project/vllm-metal/blob/main/docs/installation.md)：**独立 Python 环境 + 预编译 macOS arm64 wheel**，不把 Omni 追加到已有 vllm-metal 的 Homebrew 私有环境。
@@ -150,7 +160,8 @@ VLLM_OMNI_METAL_NATIVE_MODEL=/path/to/local/higgs-checkpoint \
 - `shm_connector.py`：Metal worker 中的 POSIX SHM 兼容实现；私有临时锁目录、短物理名字和长度帧，避开 Linux `/dev/shm` 假设。
 - `native_compat.py`：只在 MPS 模型实例上克隆包含 CUDA capture 查询的方法；原始 class/module 和 `torch.cuda` 不变，范围检查继续执行。
 - `runtime.py` / `config.py` / `worker.py`：完整 Torch/MLX pipeline 和 Diffusers 的共用执行层。
-- `compat.py`：幂等且 scoped 的配置、attention 和 MPS profiler 桥接，保留普通 LLM hook。
+- `normalization.py`：通过上游 IR 合同复用融合 MPS RMSNorm，保留残差精度顺序与参数后备。
+- `compat.py`：幂等且 scoped 的配置、attention、原生 worker IR 默认优先级和 MPS profiler 桥接，保留普通 LLM hook。
 
 协议与限制见 [通用后端设计](docs/generic-backend.md)。没有修改上游安装文件、MPS 内存水位或全局 `torch.cuda`。MPS peak-memory 的 `0` 表示指标不可用；MLX 内存不计入 MPS 指标。
 

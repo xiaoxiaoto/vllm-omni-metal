@@ -50,6 +50,26 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \\
 
 基准只做小张量，设置 256 MiB 张量估计上限和 3 GiB 系统 headroom；同步计时包含 bridge 与 KV 写入。Apple M4 Pro 的默认 BF16 4×2048、16 Q / 4 KV heads、head size 128，20 次中位数为旧路径 5.956 ms / 原生路径 0.512 ms（11.6×）。该结果不代表模型级吞吐、生产负载或其他硬件；真实大权重/听感未验收。
 
+### RMSNorm 与残差归一化
+
+`normalization.py` 移植上游已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的 [normalization adapter](https://github.com/vllm-project/vllm-metal/blob/fb9fbc3bd857bee3f7a74f59ee46cc068fa7267c/vllm_metal/pytorch_backend/normalization.py)，commit `fb9fbc3bd857bee3f7a74f59ee46cc068fa7267c`，Apache-2.0。当前固定的 release wheel 尚不包含该 adapter，因此只移植小型 Python 适配，不复制 Metal/C++ kernel、不升级 vllm-metal。底层使用已安装 PyTorch 的 `torch.nn.functional.rms_norm`；本机复现了上游 FP16/BF16 plain/residual 四组精度用例。
+
+原生 worker 的 IR 默认优先级是 `omni_mps → native`，仅按 worker 合同选择，不按模型名分支。平台 defaults 在 DeviceConfig 转为 MPS 之前解析，因此以原生 worker 类路径限定；每个 spawn worker 导入 adapter 后，由上游 WorkerBase 安装配置的优先级。普通 LLM 默认 hook 保留，用户显式优先级仍由上游 KernelConfig 合并规则优先保留。注册的是 IR 算子实现，不是模型 registry 或模型方法替换。
+
+优化只选择 MPS FP16/BF16、非空输入、同 dtype/device 且宽度匹配的一维 learned weight、无 variance override。残差另外要求相同 shape/device/dtype。CPU、FP32、无 weight、部分 variance、混合权重或广播等原生合法参数仍交给上游 native；不把 MPS tensor 搬到 CPU，不忽略其他不支持配置。
+
+残差使用 FP32 sum 计算 variance，再按 vLLM 顺序先 cast normalized 值后乘 learned weight，并单独返回 cast 后的 residual sum；输入不就地改写。它使用融合 RMSNorm，但 add、cast、multiply 仍是独立操作，不宣称整个 residual+norm 是单 kernel 融合。
+
+`tests/test_normalization.py` 检查 dispatch、用户优先级与作用域、spawn 导入、精度边界、非连续多维输入、maybe_inplace 语义和原生后备。`tests/test_native_runner.py` 新增 BF16 随机 Llama/Qwen3，检查真实配置已选择新 IR 优先级，保持 CPU HF greedy 和 seed 隔离对照。
+
+```bash
+VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \\
+  tests/test_normalization.py tests/test_native_runner.py
+.venv-vllm-omni-metal/bin/python examples/benchmark_normalization.py --require-speedup
+```
+
+基准限制估计张量 64 MiB、保留系统 headroom 3 GiB、不加载模型。M4 Pro、BF16 4×4096、30 次同步中位数的一次实测：plain 0.182 / 0.152 ms（1.19×），residual 0.191 / 0.170 ms（1.12×）。包含 IR dispatch 与 GPU 同步，不等于生产吞吐；真实 Higgs/YuE2、大上下文和完整生产负载未在该路径验收。
+
 ### 请求与模型 hook
 
 处理 new/cached/resumed/finished 请求、外部 request ID、token history 和独立 MPS RNG。普通模型只接收其 forward 签名接受的 kwargs；原生模型仍可接收 Omni runtime information、seq counts 和 query boundaries。

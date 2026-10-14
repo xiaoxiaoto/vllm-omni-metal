@@ -339,8 +339,10 @@ def test_prepare_and_sparse_sampler_on_default_mps_device(runner):
     reason="requires Apple Silicon and explicit integration opt-in",
 )
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-@pytest.mark.parametrize("head_size", [8, 64])
-def test_two_native_language_architectures_on_mps(tmp_path, architecture, head_size, monkeypatch):
+@pytest.mark.parametrize("head_size,dtype", [(8, "float32"), (64, "float32"), (64, "bfloat16")])
+def test_two_native_language_architectures_on_mps(
+    tmp_path, architecture, head_size, dtype, monkeypatch
+):
     from transformers import LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM
     from vllm import LLM
 
@@ -358,7 +360,7 @@ def test_two_native_language_architectures_on_mps(tmp_path, architecture, head_s
         bos_token_id=1,
         eos_token_id=2,
     )
-    reference = model_cls(config).eval()
+    reference = model_cls(config).to(getattr(torch, dtype)).eval()
     reference.save_pretrained(tmp_path)
     prompts = [[3, 4, 5], [9, 10]]
     expected = []
@@ -382,7 +384,7 @@ def test_two_native_language_architectures_on_mps(tmp_path, architecture, head_s
         model=str(tmp_path),
         worker_cls="vllm_omni_metal.native_worker.MetalARWorker",
         distributed_executor_backend="uni",
-        dtype="float32",
+        dtype=dtype,
         enforce_eager=True,
         enable_prefix_caching=False,
         async_scheduling=False,
@@ -392,6 +394,8 @@ def test_two_native_language_architectures_on_mps(tmp_path, architecture, head_s
         num_gpu_blocks_override=32,
     )
     try:
+        priorities = llm.llm_engine.vllm_config.kernel_config.ir_op_priority
+        assert priorities.rms_norm == priorities.fused_add_rms_norm == ["omni_mps", "native"]
         output = llm.generate(
             [{"prompt_token_ids": prompt} for prompt in prompts],
             SamplingParams(temperature=0, max_tokens=6, ignore_eos=True, detokenize=False),

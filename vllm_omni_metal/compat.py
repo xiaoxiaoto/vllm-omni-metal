@@ -10,6 +10,7 @@ def apply_compat_patches() -> None:
 
     _patch_memory_profiler(MetalPlatform)
     _patch_native_attention(MetalPlatform)
+    _patch_native_ir_priority(MetalPlatform)
     original = MetalPlatform.check_and_update_config.__func__
     if getattr(original, "_omni_metal_patch", False):
         return
@@ -58,6 +59,32 @@ def _patch_native_attention(platform_cls) -> None:
 
     get_attn_backend_cls.__func__._omni_metal_patch = True
     platform_cls.get_attn_backend_cls = get_attn_backend_cls
+
+
+def _patch_native_ir_priority(platform_cls) -> None:
+    original = platform_cls.get_default_ir_op_priority.__func__
+    if getattr(original, "_omni_metal_patch", False):
+        return
+
+    @classmethod
+    @wraps(original)
+    def get_default_ir_op_priority(cls, config):
+        worker = getattr(getattr(config, "parallel_config", None), "worker_cls", "")
+        # Defaults are resolved before the later hook changes DeviceConfig to MPS.
+        if isinstance(worker, str) and worker.startswith("vllm_omni_metal.native_worker."):
+            from vllm.config.kernel import IrOpPriorityConfig
+
+            import vllm_omni_metal.normalization  # noqa: F401
+
+            return IrOpPriorityConfig.with_default(
+                ["native"],
+                rms_norm=["omni_mps", "native"],
+                fused_add_rms_norm=["omni_mps", "native"],
+            )
+        return original(cls, config)
+
+    get_default_ir_op_priority.__func__._omni_metal_patch = True
+    platform_cls.get_default_ir_op_priority = get_default_ir_op_priority
 
 
 def _patch_memory_profiler(platform_cls) -> None:
