@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Dense paged KV storage with seek-free causal SDPA on MPS."""
+"""Dense paged KV with upstream Metal kernels and a Torch SDPA reference path."""
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -69,6 +70,14 @@ class MetalAttentionImpl(AttentionImpl):
         kv_sharing_target_layer_name=None,
         **kwargs,
     ):
+        if min(num_heads, num_kv_heads, head_size) <= 0:
+            raise ValueError("attention head counts and head size must be positive")
+        if not math.isfinite(scale):
+            raise ValueError("attention scale must be finite")
+        if sliding_window is not None and (
+            not isinstance(sliding_window, int) or sliding_window <= 0
+        ):
+            raise ValueError("sliding window must be a positive integer")
         if num_heads % num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
         if alibi_slopes is not None or logits_soft_cap or kv_sharing_target_layer_name:
@@ -107,25 +116,77 @@ class MetalAttentionImpl(AttentionImpl):
         starts = meta.query_start_loc
         lengths = meta.seq_lens
         tables = meta.block_tables
+        for tensor, heads in (
+            (query, self.num_heads),
+            (key, self.num_kv_heads),
+            (value, self.num_kv_heads),
+        ):
+            expected = (heads * self.head_size,) if tensor.ndim == 2 else (heads, self.head_size)
+            if tensor.ndim not in (2, 3) or tensor.shape[1:] != expected:
+                raise ValueError("Q/K/V shape does not match attention heads")
+        tensors = (query, key, value, kv_cache)
+        if query.device.type not in ("cpu", "mps") or any(
+            t.device != query.device for t in tensors
+        ):
+            raise ValueError("Q/K/V and KV cache must be on the same CPU or MPS device")
+        if query.dtype not in (torch.float32, torch.float16, torch.bfloat16) or any(
+            t.dtype != query.dtype for t in tensors
+        ):
+            raise ValueError("Q/K/V and KV cache must share an unquantized floating dtype")
         q = query.reshape(-1, self.num_heads, self.head_size)
         k = key.reshape(-1, self.num_kv_heads, self.head_size)
         v = value.reshape(-1, self.num_kv_heads, self.head_size)
-        if len(starts) != len(lengths) + 1 or len(tables) != len(lengths):
+        if output is not None and (
+            output.shape != query.shape
+            or output.dtype != query.dtype
+            or output.device != query.device
+        ):
+            raise ValueError("output shape/device/dtype must match query")
+        if not lengths or len(starts) != len(lengths) + 1 or len(tables) != len(lengths):
             raise ValueError("inconsistent request/block metadata")
         if starts[0] != 0 or starts[-1] != len(q) or len(k) != len(q) or len(v) != len(q):
             raise ValueError("query boundaries do not match Q/K/V rows")
-        if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
+        if (
+            kv_cache.ndim != 5
+            or kv_cache.shape[0] != 2
+            or kv_cache.shape[3:] != (self.num_kv_heads, self.head_size)
+            or min(kv_cache.shape) <= 0
+        ):
             raise ValueError("expected paged KV shape [2, blocks, block_size, heads, head_size]")
+        span = 1
+        for stride, size in sorted(zip(kv_cache.stride(), kv_cache.shape, strict=True)):
+            if size > 1:
+                if stride < span:
+                    raise ValueError("KV cache strides must not overlap")
+                span += (size - 1) * stride
         block_size = kv_cache.shape[2]
+        used_blocks = set()
         # Validate the whole batch before mutating any shared cache page.
         for i, length in enumerate(lengths):
+            if type(length) is not int or length <= 0 or length >= 2**31:
+                raise ValueError("sequence length must be a positive int32")
+            if type(starts[i]) is not int or type(starts[i + 1]) is not int:
+                raise ValueError("query boundaries must be integers")
             count = starts[i + 1] - starts[i]
             pages = (length + block_size - 1) // block_size
             table = tables[i][:pages]
             if count <= 0 or count > length or len(table) != pages:
                 raise ValueError("invalid query length or insufficient block table")
-            if any(block < 0 or block >= kv_cache.shape[1] for block in table):
+            if any(
+                type(block) is not int or block < 0 or block >= kv_cache.shape[1] for block in table
+            ):
                 raise ValueError("block index outside KV allocation")
+            if len(set(table)) != len(table) or used_blocks.intersection(table):
+                raise ValueError("KV blocks must not alias within or across requests")
+            used_blocks.update(table)
+        from vllm_omni_metal.metal_attention import paged_attention, supports_paged_attention
+
+        if supports_paged_attention(q, kv_cache):
+            result = paged_attention(q, k, v, kv_cache, meta, self.scale, self.sliding_window)
+            if output is not None:
+                output.copy_(result.reshape_as(output))
+                return output
+            return result
         results = []
         for i, length in enumerate(lengths):
             begin, end = starts[i : i + 2]
@@ -158,6 +219,6 @@ class MetalAttentionImpl(AttentionImpl):
             results.append(attended.squeeze(0).transpose(0, 1).reshape(count, -1))
         result = torch.cat(results, dim=0)
         if output is not None:
-            output.reshape_as(result).copy_(result)
+            output.copy_(result.reshape_as(output))
             return output
         return result

@@ -31,6 +31,10 @@ python -m pip check
 
 安装器只接受新目录或它自己标记创建的环境，不接管任意已有 venv/Homebrew libexec，不使用 `--clear`。失败时保留环境和缓存供诊断、重试。依赖和插件在同一次 uv 解析中安装，保持 vllm-metal 声明的 mlx-lm Git URL 可见。
 
+总部署预检可以设置 `VLLM_OMNI_COMMIT=<完整 40 位 SHA>`，让安装器从查询到的官方 Omni 主干 commit 构建；省略时仍使用上述固定快照。非法 commit 会在安装前拒绝。开发版公开版本与 CPU 构建标记保持明确，不伪装稳定发布。
+
+`docker-compose/start.sh` 的模型启动现在统一调用 `prepare_backend.py`：查询官方最新核心标签与 Omni main，构建独立 Application Support 后端，并从本仓库构建非 editable wheel。四个模型使用同一版本组，YuE2/MOSS 私有扩展只覆盖各自模型适配；不修改 Homebrew。新官方核心超出当前兼容矩阵时明确拒绝启动，须先更新 native wheel pins、插件依赖和部署校验并重新验证，不能逐包盲升。
+
 更新一个已使用的环境前，先停止所有使用它的服务。本次安装使用新的独立环境，保留运行中的 Higgs 及旧 Homebrew 环境；没有自动迁移服务。
 
 ## 2. Homebrew：发布本次改动后
@@ -54,7 +58,7 @@ brew test xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
 
 配方使用独立 `libexec`，仅链接 `vllm-omni`，不接管已有 `vllm`。保留 `preserve_rpath` 和 TVM-FFI/xgrammar RECORD。Python 位于 `$(brew --prefix vllm-omni-metal)/libexec/bin/python`，无需激活。
 
-不要只比较插件 HEAD 是否变化来判断依赖已升级。使用 Higgs 部署时，`docker-compose/higgs-tts-3/start.sh` 的版本检查已同步为 0.31 / Omni dev 快照；先发布、停止、重装，再启动，不能复用旧 0.30 栈。
+不要只比较插件 HEAD 是否变化来判断依赖已升级。总部署已改用统一隔离后端，不再依赖上述 Homebrew Formula；单独使用 Formula 的项目仍需按发布、停止、重装的顺序迁移，不能复用旧 0.30 栈。
 
 本次没有运行实际 `brew install/reinstall`，没有改 Homebrew libexec 或重启已有服务。
 

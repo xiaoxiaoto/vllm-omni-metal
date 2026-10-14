@@ -5,7 +5,6 @@ import json
 import os
 import runpy
 import subprocess
-import sys
 import tomllib
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -23,7 +22,7 @@ def installer(tmp_path):
     scripts = {
         "uname": '#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo "${TEST_ARCH:-arm64}";; esac\n',
         "sw_vers": '#!/bin/sh\necho "${TEST_MACOS:-15.0}"\n',
-        "uv": f"#!{sys.executable}\n"
+        "uv": "#!/usr/bin/env python3\n"
         + """import json, os, pathlib, sys
 args = sys.argv[1:]
 with open(os.environ['TEST_LOG'], 'a') as file:
@@ -116,6 +115,24 @@ def test_failed_dependency_install_stops_before_plugin_and_is_retryable(installe
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     assert len(calls) == 2 and calls[-1]["args"][:2] == ["pip", "install"]
     assert run("--venv", str(venv)).returncode == 0
+
+
+def test_install_uses_requested_official_omni_snapshot(installer, tmp_path):
+    run, log = installer
+    commit = "a" * 40
+    result = run("--venv", str(tmp_path / "latest"), VLLM_OMNI_COMMIT=commit)
+    assert result.returncode == 0, result.stderr
+    installs = [json.loads(line) for line in log.read_text().splitlines()]
+    install = next(call for call in installs if call["args"][:2] == ["pip", "install"])
+    assert any(arg.endswith("@" + commit) for arg in install["args"])
+
+
+@pytest.mark.parametrize("commit", ["main", "abcd", "-invalid", "a" * 40 + ";bad"])
+def test_install_rejects_non_commit_snapshot_before_any_changes(installer, tmp_path, commit):
+    run, log = installer
+    result = run("--venv", str(tmp_path / "unused"), VLLM_OMNI_COMMIT=commit)
+    assert result.returncode != 0 and "完整 Git commit" in result.stderr
+    assert not log.exists() and not (tmp_path / "unused").exists()
 
 
 def test_plugin_version_matches_omni_and_source_fallback(monkeypatch):

@@ -23,6 +23,20 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 **YuE2 尚未完成端到端 Metal 支持。** 最新 Omni 有原生实现，但其模型采样仍有 CPU generator/MPS 张量不匹配和 CUDA pinned-memory/event 假设；这些修复属于上游模型，不在本插件硬编码。兼容性核对、实际测试及版本升级边界见 [YuE2 接入状态](docs/yue2-readiness.md)。安装入口已升级到 0.31 native wheels + 固定 Omni main 快照，Omni 明确标为开发版，不把它伪装成稳定 release。
 
+## 通用算子优化
+
+原生 attention 复用 GitHub 已发布的 [vllm-metal v0.31.0](https://github.com/vllm-project/vllm-metal/releases/tag/v0.31.0) `reshape_and_cache` / `paged_attention_primitive`，不另写 Metal kernel、不升级依赖。通过上游 DLPack bridge 共享 Torch KV，直接读取物理分页，避免历史 KV gather 与 GQA 复制；选择条件只有设备、dtype、head/block size 和布局，没有模型名分支。
+
+优化域为 FP32/FP16/BF16、head size 64/96/128/256/512、block size 8/16/32，以及连续 NHD 页内布局；其他已支持形状保留原有 MPS SDPA，不自动转 CPU。覆盖 prefill/decode、sliding window、MHA/GQA/MQA、strided KV offset 和请求隔离。跨 Torch/MLX 有同步开销，不等于纯 Torch-stream launcher，详见 [协议与来源](docs/generic-backend.md#已发布算子来源与验证)。
+
+复现小张量 decode 基准（不加载模型，包含跨框架同步）：
+
+```bash
+.venv-vllm-omni-metal/bin/python examples/benchmark_attention.py --require-speedup
+```
+
+Apple M4 Pro、BF16、batch=4、context=2048、Q/KV heads=16/4、head size=128，20 次同步计时中位数：旧 gather+SDPA **5.956 ms**，上游分页算子 **0.512 ms**，约 **11.6×**。这是指定形状的算子端到端微基准，不是模型吞吐或所有输入的加速承诺；真实 Higgs 大权重未在新路径重跑。
+
 ## 环境与安装
 
 参考 [vllm-metal 安装方式](https://github.com/vllm-project/vllm-metal/blob/main/docs/installation.md)：**独立 Python 环境 + 预编译 macOS arm64 wheel**，不把 Omni 追加到已有 vllm-metal 的 Homebrew 私有环境。
@@ -85,7 +99,7 @@ async_scheduling: false
 gpu_memory_utilization: 0.3
 ```
 
-保留模型自己的 stage IDs、执行类型、connectors、stage processors 和采样参数。不要直接照搬含 FLASHINFER / prefix caching 的 CUDA 高吞吐 profile；`CUSTOM` 对应本插件的 MPS SDPA，不是 Torch Diffusers 的 `TORCH_SDPA` 名称。
+保留模型自己的 stage IDs、执行类型、connectors、stage processors 和采样参数。不要直接照搬含 FLASHINFER / prefix caching 的 CUDA 高吞吐 profile；`CUSTOM` 对应本插件的 Metal paged attention / MPS SDPA，不是 Torch Diffusers 的 `TORCH_SDPA` 名称。
 
 ```bash
 .venv-vllm-omni-metal/bin/vllm-omni serve /path/to/local/checkpoint --omni \
@@ -132,7 +146,7 @@ VLLM_OMNI_METAL_NATIVE_MODEL=/path/to/local/higgs-checkpoint \
 
 - `platform.py`：MPS 设备、内存和 worker 选择。
 - `native_worker.py` / `native_runner.py`：原生 scheduler-driven worker、加载、KV 布局、请求状态、采样 hook、CPU payload 与上游传输。
-- `native_attention.py`：按 block table 读写物理 KV 页，正确 prefill/decode causal mask 和 GQA；当前实现以正确性为先，不是专用高吞吐 Metal kernel。
+- `native_attention.py` / `metal_attention.py`：全 batch 输入校验后按算子参数选择上游分页 Metal kernel 或 MPS SDPA；保留实际 KV offset/strides、causal offset、GQA 和请求隔离。
 - `shm_connector.py`：Metal worker 中的 POSIX SHM 兼容实现；私有临时锁目录、短物理名字和长度帧，避开 Linux `/dev/shm` 假设。
 - `native_compat.py`：只在 MPS 模型实例上克隆包含 CUDA capture 查询的方法；原始 class/module 和 `torch.cuda` 不变，范围检查继续执行。
 - `runtime.py` / `config.py` / `worker.py`：完整 Torch/MLX pipeline 和 Diffusers 的共用执行层。

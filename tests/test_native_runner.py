@@ -7,6 +7,8 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.sampling_params import SamplingParams
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 
 from vllm_omni_metal import is_available
 from vllm_omni_metal.native_runner import MetalNativeModelRunner
@@ -182,6 +184,89 @@ def test_terminal_audio_from_model_sampler_is_routed_by_request_id(runner):
     assert all("hidden_states" not in payload for payload in payloads)
 
 
+def decode_wire(result):
+    payloads = result.multimodal_outputs
+    if payloads is None:
+        payloads = [None] * len(result.req_ids)
+    message = OmniEngineCoreOutputs(
+        outputs=[
+            OmniEngineCoreOutput(request_id=rid, new_token_ids=[], multimodal_output=payload)
+            for rid, payload in zip(result.req_ids, payloads, strict=True)
+        ]
+    )
+    return MsgpackDecoder(OmniEngineCoreOutputs).decode(MsgpackEncoder().encode(message))
+
+
+def test_terminal_scalar_metadata_matches_tensor_wire_contract(runner):
+    class ScalarMetadataModel(SparseModel):
+        def sample(self, logits, sampling_metadata):
+            result = super().sample(logits, sampling_metadata)
+            self.payload["meta"].update(truncated=[0, 1], error=[0, 0])
+            return result
+
+    runner.model = ScalarMetadataModel()
+    result = runner.execute_model(
+        make_output([request("a", [1]), request("b", [6])], {"a": 1, "b": 1})
+    )
+    decoded = decode_wire(result)
+    for output, audio, truncated in zip(decoded.outputs, [2.0, 7.0], [1, 0], strict=True):
+        payload = output.multimodal_output
+        assert all(isinstance(value, torch.Tensor) for value in payload.values())
+        assert payload["model_outputs"].item() == audio
+        assert payload["meta.truncated"].item() == truncated
+        assert payload["meta.error"].item() == 0
+    assert result.inter_stage_outputs[0]["meta.truncated"] == 1
+    assert isinstance(result.inter_stage_outputs[0]["meta.truncated"], int)
+
+
+def test_numeric_wire_normalization_preserves_inter_stage_types(runner, caplog):
+    payload = {
+        "model_outputs": torch.empty(2, 0),
+        "sr": 48000,
+        "meta.error": True,
+        "gain": 0.5,
+        "codes": [1, 2],
+        "shape": (2, 0),
+        "absent": None,
+        "meta.label": "conditioning",
+    }
+    result = runner._output(["a"], [[]], [payload])
+    received = decode_wire(result).outputs[0].multimodal_output
+    assert tuple(received["model_outputs"].shape) == (2, 0)
+    assert received["sr"].item() == 48000
+    assert received["meta.error"].item() is True
+    assert received["gain"].item() == 0.5
+    assert received["codes"].tolist() == [1, 2]
+    assert received["shape"].tolist() == [2, 0]
+    assert "absent" not in received and "meta.label" not in received
+    assert "meta.label" in caplog.text
+    assert result.inter_stage_outputs == [payload]
+    assert isinstance(payload["sr"], int)
+    assert payload["meta.label"] == "conditioning"
+
+
+def test_async_wire_normalization_keeps_partition_and_absent_requests(runner):
+    runner._async_chunk = True
+    payloads = [
+        {"meta.label": "first"},
+        {"model_outputs": torch.ones(2, 16), "sr": 48000, "meta.label": "second"},
+    ]
+    result = runner._output(["a", "b"], [[], []], payloads)
+    decoded = decode_wire(result)
+    assert decoded.outputs[0].multimodal_output is None
+    assert decoded.outputs[1].multimodal_output["sr"].item() == 48000
+    assert result.inter_stage_outputs == [{"meta.label": "first"}, {"meta.label": "second"}]
+    result = runner._output(["a"], [[]], [{}])
+    assert result.multimodal_outputs is None and result.inter_stage_outputs is None
+    assert runner._output([], [], []).multimodal_outputs is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), [float("nan")]])
+def test_nonfinite_numeric_metadata_rejected_after_wire_normalization(runner, value):
+    with pytest.raises(ValueError, match="non-finite"):
+        runner._output(["a"], [[]], [{"value": value}])
+
+
 @pytest.mark.parametrize("case", ["empty", "subset", "duplicate", "unknown", "length", "marker"])
 def test_sparse_output_validation_and_empty_steps(runner, case):
     class SparseCase(SparseModel):
@@ -254,7 +339,8 @@ def test_prepare_and_sparse_sampler_on_default_mps_device(runner):
     reason="requires Apple Silicon and explicit integration opt-in",
 )
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-def test_two_native_language_architectures_on_mps(tmp_path, architecture):
+@pytest.mark.parametrize("head_size", [8, 64])
+def test_two_native_language_architectures_on_mps(tmp_path, architecture, head_size, monkeypatch):
     from transformers import LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM
     from vllm import LLM
 
@@ -263,8 +349,8 @@ def test_two_native_language_architectures_on_mps(tmp_path, architecture):
     torch.manual_seed(83)
     config = config_cls(
         vocab_size=64,
-        hidden_size=32,
-        intermediate_size=64,
+        hidden_size=4 * head_size,
+        intermediate_size=8 * head_size,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -283,6 +369,15 @@ def test_two_native_language_architectures_on_mps(tmp_path, architecture):
                 logits = reference(torch.tensor([tokens])).logits[0, -1]
                 tokens.append(int(logits.argmax()))
             expected.append(tokens[len(prompt) :])
+    if head_size == 64:
+        sdpa = torch.nn.functional.scaled_dot_product_attention
+
+        def forbid_mps_sdpa(query, *args, **kwargs):
+            if query.device.type == "mps":
+                raise AssertionError("supported geometry must use upstream paged kernels")
+            return sdpa(query, *args, **kwargs)
+
+        monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", forbid_mps_sdpa)
     llm = LLM(
         model=str(tmp_path),
         worker_cls="vllm_omni_metal.native_worker.MetalARWorker",

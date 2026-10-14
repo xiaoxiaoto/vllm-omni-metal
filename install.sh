@@ -5,7 +5,9 @@ set -euo pipefail
 # Match stable 0.31 native wheels with a frozen Omni main snapshot.
 vllm_url='https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl#sha256=21378516a51ff15029f71168e827b94660e21b39484eb52277166f01ac7dd686'
 metal_url='https://github.com/vllm-project/vllm-metal/releases/download/v0.31.0/vllm_metal-0.31.0-cp312-cp312-macosx_15_0_arm64.whl#sha256=e2ab31296f8c42d8b65c8d5f5490f160087d1070178444870a5672e44aaacf6e'
-omni_source='vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@2ec5f265c69520cdd5e5f0a19db485d38885843e'
+omni_commit="${VLLM_OMNI_COMMIT:-2ec5f265c69520cdd5e5f0a19db485d38885843e}"
+[[ "$omni_commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'VLLM_OMNI_COMMIT 必须是完整 Git commit' >&2; exit 1; }
+omni_source="vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@${omni_commit}"
 plugin_url='vllm-omni-metal @ git+https://github.com/xiaoxiaoto/vllm-omni-metal.git@main'
 
 source_dir=''
