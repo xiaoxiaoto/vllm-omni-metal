@@ -26,10 +26,18 @@ def apply_compat_patches() -> None:
                 from vllm_omni_metal.native_worker import validate_native_config
 
                 validate_native_config(config)
+                custom_ops = config.compilation_config.custom_ops
+                flags = []
+                for operation in ("silu_and_mul", "rotary_embedding"):
+                    if f"+{operation}" in custom_ops and f"-{operation}" in custom_ops:
+                        raise ValueError(f"custom_ops cannot both enable and disable {operation}")
+                    flags.append(
+                        f"-{operation}" if f"-{operation}" in custom_ops else f"+{operation}"
+                    )
                 config.device_config = DeviceConfig("mps")
                 config.compilation_config.mode = CompilationMode.NONE
                 config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                config.compilation_config.custom_ops = ["none"]
+                config.compilation_config.custom_ops = ["none", *flags]
                 config.parallel_config.disable_custom_all_reduce = True
                 return None
             return original(cls, config)

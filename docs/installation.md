@@ -11,7 +11,7 @@
 - 构建设置 `VLLM_OMNI_TARGET_DEVICE=cpu` 和 `VLLM_OMNI_VERSION_OVERRIDE=0.31.0.dev0+cpu`；前者不是 `VLLM_TARGET_DEVICE`。
 - 本次完整解析得到 PyTorch 2.13.0、Transformers 5.14.1、MLX 0.32.1、diffusers 0.40.0。Omni 限定 Transformers `>=5.13,<5.15`；不能绕过这些约束只升级某个包。
 
-本插件是纯 Python；无需编译 Metal kernel。安装需要联网下载依赖和 Git 源码，不下载模型。不要用 PyPI CUDA vLLM wheel 替代 macOS CPU wheel，也不能把最新 Omni main 与 vLLM 0.30 混装。
+本插件的默认安装无需编译 Metal kernel；可选 Torch-stream attention 复用上游 host-only launcher（仅补齐已发布 FP32 kernel 的 host dtype/路由选择），需用户显式编译 Objective-C++ host extension，不编译新 shader。安装需要联网下载依赖和 Git 源码，不下载模型。不要用 PyPI CUDA vLLM wheel 替代 macOS CPU wheel，也不能把最新 Omni main 与 vLLM 0.30 混装。
 
 ## 1. 当前源码：已实际安装验证
 
@@ -39,7 +39,7 @@ python -m pip check
 
 ## 2. Homebrew：发布本次改动后
 
-本次 Formula、插件依赖和安装器更新尚未提交/推送。旧远端 Formula 仍不会自动变成 0.31。新 Formula **仅支持 HEAD**：旧 0.1.0 源码快照要求 0.30，不能作为新栈的稳定源码冒用；暂无匹配新栈的已发布插件 release。
+0.31 固定栈及此前源码已发布，但本次新增 vpipe/FP32 算子与验收改动尚未提交/推送；远端 HEAD 不会自动包含工作树。新 Formula **仅支持 HEAD**：旧 0.1.0 源码快照要求 0.30，不能作为新栈的稳定源码冒用；暂无匹配新栈的已发布插件 release。
 
 发布配套源码与 Formula 后：
 
@@ -71,6 +71,25 @@ source ~/.venv-vllm-omni-metal/bin/activate
 
 无本地 checkout 时安装本插件 Git main；它与 Homebrew HEAD 一样是源码入口，不再使用要求 0.30 的旧插件 archive。native wheels 和 Omni commit 仍固定。没有 uv 时采用固定 uv bootstrap。远端 main 必须同时包含本次依赖与代码变更，当前未验证此远端入口。
 
+## 可选：本地 Torch-stream attention
+
+固定的 0.31 wheel 不含 #858 的新 MPS launcher。默认路径无需编译并保留 MLX bridge；若已有 Apple Command Line Tools，可在**选定独立环境**内运行一次：
+
+```bash
+.venv-vllm-omni-metal/bin/python -m vllm_omni_metal.mps_attention
+# curl 环境或 Homebrew：使用各自环境的 python -m 同一模块，不混用基础 vllm 环境。
+```
+
+这是本地显式构建，不升级依赖、不安装工具、不修改上游 package 或当前服务。产物在用户私有 `~/.cache/vllm-omni-metal/mps/`，绑定源码、Torch 环境与 Python ABI；构建后新 worker 的支持域 FP32/FP16/BF16 attention 使用 Torch stream，缺少匹配产物仍走 bridge；FP32 prefill 不使用仅支持 half/bfloat 的 tiled shader。引擎启动/请求处理不触发编译；环境或插件源码改变后需重建并在正常服务维护流程下启动新 worker。本次在开发环境及全新 `/tmp` 私有安装器环境完成真实 source install、CLI、pipcheck 和显式 host launcher 编译；Homebrew/curl 新入口仍未完整验收，不覆盖已有安装/服务；详见[执行合同](generic-backend.md#可选-torch-stream-attention)。
+
+## 可选：vpipe 源算子 metallib
+
+```bash
+python -m vllm_omni_metal.vpipe_kernels
+```
+
+需要**已安装的 Apple Metal compiler**（`xcrun --find metal`）；它与仅能编译 host Objective-C++ 的 Command Line Tools 不等同。构建在本地私有 cache、离线、显式执行，不安装工具、不修改上游依赖。生产 worker 缺少匹配 metallib 时保留原路径，绝不在 startup/request 自动编译。本机缺 compiler，所以本次仅验证了隔离源 shader/数值/benchmark，未宣称 AOT 或真实 worker 已可用；单行小 SwiGLU 无稳定收益，仍不接入默认路径。来源和限制见[执行协议](generic-backend.md#vpipe-通用片段)。
+
 ## 使用与验证
 
 ```bash
@@ -83,7 +102,7 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q
 
 原生 profile 要求 CUSTOM、单设备、同步调度、关闭 prefix cache，见 [通用后端协议](generic-backend.md)。安装器不启动模型，不替换 registry、模型 topology 或请求语义。
 
-本次从新环境完成真实联网解析/安装：`pip check`、版本与 MPS generator 校验、CLI `--help`、**72 passed / 1 skipped**。测试包括随机 Llama/Qwen3、tiny SD 和原生 generation 的真实 MPS 推理；跳过的是需显式提供大权重的 Higgs 验收。mock 安装回归另覆盖源码/curl 命令、安全边界、固定版本与 checksum 同步。
+本轮从新的私有安装器环境完成真实联网解析/安装（223 packages）、`pip check`、版本与 MPS generator 校验、CLI `--help`、显式 attention host 编译和 **277 passed / 1 skipped**。开发环境另通过166个非集成测试及同一277/1完整回归。测试包括随机 Llama/Qwen3、tiny SD、原生 generation、FP32 paged attention 和隔离 vpipe shader；跳过的是需显式提供大权重的 Higgs 验收。vpipe AOT 仍因 Metal compiler 不可用阻塞，不能把隔离 shader 测试算成真实 worker 新路径成功。mock 安装回归另覆盖源码/curl 命令、安全边界、固定版本与 checksum 同步。
 
 YuE2 的模型级 MPS 障碍尚未修复；更新依赖不等于音乐生成可用，见 [接入状态](yue2-readiness.md)。PyAV/OpenCV/系统 FFmpeg 存在重复 Objective-C 类警告，本次 CLI 与测试可通过，但媒体视频路径未额外验收。
 

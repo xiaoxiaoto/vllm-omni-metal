@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CacheConfig, OffloadConfig, ParallelConfig
+from vllm.config import CacheConfig, CompilationConfig, OffloadConfig, ParallelConfig
 
 from vllm_omni_metal.native_worker import MetalNativeWorker, validate_native_config
 from vllm_omni_metal.platform import MetalOmniPlatform
@@ -39,6 +39,46 @@ def test_native_config_boundaries(config):
     config.offload_config.uva.cpu_offload_gb = 1
     with pytest.raises(NotImplementedError, match="offload"):
         validate_native_config(config)
+
+
+@pytest.mark.parametrize(
+    "ops,flag",
+    [
+        (["all"], "+silu_and_mul"),
+        (["none"], "+silu_and_mul"),
+        (["none", "+silu_and_mul"], "+silu_and_mul"),
+        (["all", "-silu_and_mul"], "-silu_and_mul"),
+        (["all", "-rotary_embedding"], "+silu_and_mul"),
+    ],
+)
+def test_native_config_enables_only_safe_oot_activation_and_preserves_opt_out(config, ops, flag):
+    from vllm_metal.platform import MetalPlatform
+
+    from vllm_omni_metal.compat import apply_compat_patches
+
+    config.parallel_config.worker_cls = "vllm_omni_metal.native_worker.MetalARWorker"
+    config.compilation_config = CompilationConfig(custom_ops=ops)
+    apply_compat_patches()
+    for _ in range(2):
+        MetalPlatform.check_and_update_config(config)
+        rotary_flag = "-rotary_embedding" if "-rotary_embedding" in ops else "+rotary_embedding"
+        assert config.compilation_config.custom_ops == ["none", flag, rotary_flag]
+        assert config.device_config.device_type == "mps"
+
+
+@pytest.mark.parametrize("operation", ["silu_and_mul", "rotary_embedding"])
+def test_native_config_rejects_conflicting_activation_directives(config, operation):
+    from vllm_metal.platform import MetalPlatform
+
+    from vllm_omni_metal.compat import apply_compat_patches
+
+    config.parallel_config.worker_cls = "vllm_omni_metal.native_worker.MetalARWorker"
+    config.compilation_config = CompilationConfig(custom_ops=["none"])
+    # Hooks can mutate the list after the constructor's validation.
+    config.compilation_config.custom_ops.extend([f"+{operation}", f"-{operation}"])
+    apply_compat_patches()
+    with pytest.raises(ValueError, match="both enable and disable"):
+        MetalPlatform.check_and_update_config(config)
 
 
 def test_kv_memory_reserves_host_headroom_and_respects_explicit_budget(config, monkeypatch):

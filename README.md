@@ -27,7 +27,7 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 原生 attention 复用 GitHub 已发布的 [vllm-metal v0.31.0](https://github.com/vllm-project/vllm-metal/releases/tag/v0.31.0) `reshape_and_cache` / `paged_attention_primitive`，不另写 Metal kernel、不升级依赖。通过上游 DLPack bridge 共享 Torch KV，直接读取物理分页，避免历史 KV gather 与 GQA 复制；选择条件只有设备、dtype、head/block size 和布局，没有模型名分支。
 
-优化域为 FP32/FP16/BF16、head size 64/96/128/256/512、block size 8/16/32，以及连续 NHD 页内布局；其他已支持形状保留原有 MPS SDPA，不自动转 CPU。覆盖 prefill/decode、sliding window、MHA/GQA/MQA、strided KV offset 和请求隔离。跨 Torch/MLX 有同步开销，不等于纯 Torch-stream launcher，详见 [协议与来源](docs/generic-backend.md#已发布算子来源与验证)。
+优化域为 FP32/FP16/BF16、head size 64/96/128/256/512、block size 8/16/32，以及连续 NHD 页内布局；其他已支持形状保留原有 MPS SDPA，不自动转 CPU。覆盖 prefill/decode、sliding window、MHA/GQA/MQA、strided KV offset 和请求隔离。默认 wheel 的 MLX bridge 有跨框架同步开销；下述可选 Torch-stream launcher 消除 attention 的桥接。FP32 同样可使用显式构建的 Torch-stream launcher（prefill 复用分页 kernel，不使用 half-only tiled shader），详见 [协议与来源](docs/generic-backend.md#已发布算子来源与验证)。
 
 复现小张量 decode 基准（不加载模型，包含跨框架同步）：
 
@@ -46,6 +46,35 @@ Apple M4 Pro、BF16、batch=4、context=2048、Q/KV heads=16/4、head size=128�
 ```
 
 Apple M4 Pro、BF16、4×4096、30 次同步计时：普通 RMSNorm 0.182 → 0.152 ms（1.19×），残差归一化 0.191 → 0.170 ms（1.12×）。这是一次指定形状的算子微基准，不代表整模型吞吐；复现会有负载波动。
+
+第三阶段接入通用 **SiLU×gate（SwiGLU）融合**：通过上游 CustomOp OOT 合同，复用已发布 MLX 的编译 SiLU 与官方 DLPack bridge，不写新 kernel、不替换模型方法。仅原生 worker 的 FP32/FP16/BF16、连续 1–3 维、无梯度、最后一维为偶数且输出元素数 ≥262144 时启用；小 decode、其他合法输入保留原设备上的上游实现。保留 SiLU 的 FP32 计算及乘 gate 前的 dtype 舍入；可用 `custom_ops=["none", "-silu_and_mul"]` 显式关闭。
+
+```bash
+.venv-vllm-omni-metal/bin/python examples/benchmark_activation.py --require-speedup
+```
+
+M4 Pro、BF16、32×8192、30 次同步中位数：原生 0.343 → 编译路径 0.170 ms（约 **2.0×**），包含 OOT dispatch、桥接和同步。小块桥接收益不稳定，因此不默认优化小 decode。随机大 MLP Llama/Qwen3 已确认真实 worker 命中新路径、greedy 与 seed 回归通过；这仍不是整模型吞吐结果。可选缓存表 NeoX RoPE 的 vpipe 移植及限制见下节；隔离算子验证不等于默认 worker 已启用。
+
+第四阶段提供可选 **纯 Torch-stream paged attention**：复用已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的 host launcher 和已安装的 0.31 shader。固定 wheel 缺少该 launcher，因此需在选定环境中显式编译一次（Apple Command Line Tools）；host adapter 仅补齐已发布 FP32 shader 的 dtype/路由选择，不升级依赖、不写 attention shader、不修改上游安装，运行时不自动编译。
+
+```bash
+.venv-vllm-omni-metal/bin/python -m vllm_omni_metal.mps_attention
+.venv-vllm-omni-metal/bin/python examples/benchmark_attention.py --require-speedup
+```
+
+编译产物在用户私有 cache，绑定源文件、Torch 环境及 Python ABI；随后新 worker 的支持域 FP32/FP16/BF16 自动选择 Torch-stream。无匹配产物保留原 bridge；已存在但损坏/不安全的产物明确报错。attention 的元数据异步送入 Torch stream，KV 写读按同一 stream 排序，无 MLX 导入或每层显式 GPU wait；**不代表整个模型没有跨框架操作**，SwiGLU 大输入仍使用 bridge。
+
+M4 Pro、BF16、batch=4、context=2048、16/4 heads、head size=128，20 次同步实测：gather+SDPA 5.936 ms、MLX bridge 0.515 ms、Torch-stream 0.477 ms；相对 bridge 约 **1.08×**，相对原 gather 约 12.45×。仅为指定形状微基准，新路径已验证独立数值对照、KV strides/offset、请求隔离与真实随机模型生成；真实大模型与 M5 NAX 尚未验收。
+
+### vpipe 通用算子移植与当前未完成项
+
+固定参考 [tgo-app-dev/vpipe](https://github.com/tgo-app-dev/vpipe/tree/6a721d5c3b74ded70001f7c02121f14ae8f5321a)（Apache-2.0），移植通用 packed SwiGLU 与缓存表 NeoX RoPE，做必要的 dtype/layout 适配；不移植模型包装、频率重算、视频/量化或 Gemma 专用 residual 逻辑。来源和精度合同见 [执行协议](docs/generic-backend.md#vpipe-通用片段)及打包的 `_native/VPIPE.md`。
+
+生产 worker **仅加载显式预编译 metallib**，缺失则保留原路径；运行 `python -m vllm_omni_metal.vpipe_kernels` 需要已安装的 Apple Metal compiler。本机 `xcrun --find metal` 失败，未安装工具。因此本次仅验证隔离 shader、OOT cache 合同及显式测试基准，不宣称新 RoPE 已在真实 worker 中加速。
+
+M4 Pro / BF16：缓存 RoPE（4 rows、hidden 4096、Q/KV heads32/8、head128）0.239 → 0.203 ms（1.18×）；单行 SwiGLU（width4096）0.138 → 0.138 ms（无收益），**不接入默认小 decode 路径**。FP32 attention batch4/context2048/head128 的三路为 6.377 / 0.617 / 0.597 ms，Torch-stream 比 bridge 快约1.03×。这些都不是模型吞吐。
+
+仍未完成：等价 residual-add+RMSNorm 单 kernel、小 decode 稳定加速、vpipe AOT/真实 worker 验收、真实 Higgs/YuE2 新路径与生产吞吐、M5 NAX。现有缓存缺少完整 Higgs/YuE2 权重，未自动下载；Homebrew/curl 当前未提交代码不能冒充已发布新入口。
 
 ## 环境与安装
 
@@ -160,7 +189,9 @@ VLLM_OMNI_METAL_NATIVE_MODEL=/path/to/local/higgs-checkpoint \
 - `shm_connector.py`：Metal worker 中的 POSIX SHM 兼容实现；私有临时锁目录、短物理名字和长度帧，避开 Linux `/dev/shm` 假设。
 - `native_compat.py`：只在 MPS 模型实例上克隆包含 CUDA capture 查询的方法；原始 class/module 和 `torch.cuda` 不变，范围检查继续执行。
 - `runtime.py` / `config.py` / `worker.py`：完整 Torch/MLX pipeline 和 Diffusers 的共用执行层。
+- `mps_attention.py` / `_native/`：可选私有 cache 构建、已合并上游 host launcher 和原样 shared headers；支持域 attention 不经过 MLX。
 - `normalization.py`：通过上游 IR 合同复用融合 MPS RMSNorm，保留残差精度顺序与参数后备。
+- `activation.py`：通过上游 OOT 算子合同复用 MLX 编译 SiLU×gate；按输入规模选择，不修改模型 registry 或原始算子类。
 - `compat.py`：幂等且 scoped 的配置、attention、原生 worker IR 默认优先级和 MPS profiler 桥接，保留普通 LLM hook。
 
 协议与限制见 [通用后端设计](docs/generic-backend.md)。没有修改上游安装文件、MPS 内存水位或全局 `torch.cuda`。MPS peak-memory 的 `0` 表示指标不可用；MLX 内存不计入 MPS 指标。

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded, synchronized comparison with the previous MPS gather + SDPA path."""
+"""Bounded, synchronized comparison of gather/SDPA, MLX bridge and Torch-stream paths."""
 
 import argparse
 import json
@@ -12,6 +12,7 @@ import psutil
 import torch
 
 from vllm_omni_metal.metal_attention import supports_paged_attention
+from vllm_omni_metal.mps_attention import get_mps_ops
 from vllm_omni_metal.native_attention import MetalAttentionImpl, MetalAttentionMetadata
 
 
@@ -71,26 +72,41 @@ def main():
     )
     impl = MetalAttentionImpl(args.heads, args.head_size, args.head_size**-0.5, args.kv_heads)
 
-    def step(native):
-        # Keep exactly the old path available as a benchmark reference, not a runtime flag.
-        with patch("vllm_omni_metal.metal_attention.supports_paged_attention", return_value=native):
+    native_ops = get_mps_ops()
+    routes = ["gather", "bridge"] + (["torch_stream"] if native_ops is not None else [])
+
+    def step(route):
+        # Benchmark controls only: production dispatch has no flags to bypass validation.
+        with (
+            patch(
+                "vllm_omni_metal.metal_attention.supports_paged_attention",
+                return_value=route != "gather",
+            ),
+            patch(
+                "vllm_omni_metal.mps_attention.get_mps_ops",
+                return_value=native_ops if route == "torch_stream" else None,
+            ),
+        ):
             return impl.forward(None, q, k, v, cache, metadata)
 
     tolerance = {torch.float32: 2e-5, torch.float16: 2e-3, torch.bfloat16: 2e-2}[dtype]
-    torch.testing.assert_close(step(True), step(False), atol=tolerance, rtol=tolerance)
+    expected = step("gather")
+    for route in routes[1:]:
+        torch.testing.assert_close(step(route), expected, atol=tolerance, rtol=tolerance)
     for _ in range(5):
-        step(False)
-        step(True)
-    samples = {False: [], True: []}
+        for route in routes:
+            step(route)
+    samples = {route: [] for route in routes}
     for _ in range(args.iterations):
-        for native in (False, True):
+        for route in routes:
             torch.mps.synchronize()
             start = perf_counter()
-            result = step(native)
+            result = step(route)
             torch.mps.synchronize()
-            samples[native].append((perf_counter() - start) * 1000)
+            samples[route].append((perf_counter() - start) * 1000)
     assert torch.isfinite(result).all()
-    reference_ms, paged_ms = (statistics.median(samples[native]) for native in (False, True))
+    medians = {route: statistics.median(values) for route, values in samples.items()}
+    reference_ms, paged_ms = medians["gather"], medians[routes[-1]]
     chip = subprocess.run(
         ["sysctl", "-n", "machdep.cpu.brand_string"],
         capture_output=True,
@@ -114,13 +130,21 @@ def main():
                 "reference_median_ms": reference_ms,
                 "paged_median_ms": paged_ms,
                 "speedup": reference_ms / paged_ms,
+                "selected_route": routes[-1],
+                "bridge_median_ms": medians["bridge"],
+                "torch_stream_median_ms": medians.get("torch_stream"),
+                "torch_stream_speedup_over_bridge": (
+                    medians["bridge"] / medians["torch_stream"] if native_ops is not None else None
+                ),
                 "estimated_tensor_mib": estimated_bytes / 1024**2,
             },
             indent=2,
         )
     )
-    if args.require_speedup and paged_ms >= reference_ms:
-        raise SystemExit("native paged attention did not beat the reference on this shape")
+    if args.require_speedup and (
+        paged_ms >= reference_ms or (native_ops is not None and paged_ms >= medians["bridge"])
+    ):
+        raise SystemExit("selected paged attention did not beat the preceding path on this shape")
 
 
 if __name__ == "__main__":

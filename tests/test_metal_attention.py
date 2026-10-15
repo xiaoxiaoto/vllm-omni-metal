@@ -18,11 +18,16 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("launcher", ["auto", "bridge"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "head_size,window", [(128, None), (64, 17), (96, None), (256, 31), (512, None)]
 )
-def test_metal_paged_attention_matches_independent_reference(dtype, head_size, window, monkeypatch):
+def test_metal_paged_attention_matches_independent_reference(
+    launcher, dtype, head_size, window, monkeypatch
+):
+    if launcher == "bridge":
+        monkeypatch.setattr("vllm_omni_metal.mps_attention.get_mps_ops", lambda: None)
     torch.manual_seed(41)
     lengths = [1031, 19]
     counts = [3, 2]
@@ -91,15 +96,16 @@ def test_metal_paged_attention_matches_independent_reference(dtype, head_size, w
     assert backing[:32].isnan().all() and backing[-32:].isnan().all()
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("heads,kv_heads,block_size", [(4, 4, 8), (8, 1, 32)])
 def test_native_prefill_decode_and_shared_storage_lifetime(
-    heads, kv_heads, block_size, monkeypatch
+    dtype, heads, kv_heads, block_size, monkeypatch
 ):
     torch.manual_seed(12)
     head_size = 64
     impl = MetalAttentionImpl(heads, head_size, head_size**-0.5, kv_heads)
     cache = torch.full(
-        (2, 16, block_size, kv_heads, head_size), float("nan"), dtype=torch.float16, device="mps"
+        (2, 16, block_size, kv_heads, head_size), float("nan"), dtype=dtype, device="mps"
     )
     tables = [list(range(1, 8)), list(range(8, 15))]
     histories = [[], []]
@@ -110,8 +116,8 @@ def test_native_prefill_decode_and_shared_storage_lifetime(
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", forbidden)
     for counts in ([39, 2], [1, 1], [3, 2]):
-        q = torch.randn(sum(counts), heads, head_size, dtype=torch.float16)
-        k = torch.randn(sum(counts), kv_heads, head_size, dtype=torch.float16)
+        q = torch.randn(sum(counts), heads, head_size, dtype=dtype)
+        k = torch.randn(sum(counts), kv_heads, head_size, dtype=dtype)
         v = torch.randn_like(k)
         expected = []
         row = 0
@@ -131,8 +137,9 @@ def test_native_prefill_decode_and_shared_storage_lifetime(
             [0, counts[0], sum(counts)], [len(h) for h in histories], tables
         )
         actual = impl.forward(None, q.to("mps"), k.to("mps"), v.to("mps"), cache, meta)
-        expected = torch.stack(expected).reshape(sum(counts), -1).half()
-        torch.testing.assert_close(actual.cpu(), expected, atol=2e-3, rtol=2e-3)
+        expected = torch.stack(expected).reshape(sum(counts), -1).to(dtype)
+        tol = {torch.float32: 2e-5, torch.float16: 2e-3, torch.bfloat16: 2e-2}[dtype]
+        torch.testing.assert_close(actual.cpu(), expected, atol=tol, rtol=tol)
         held.append((actual, actual.clone()))
         for previous, saved in held:
             torch.testing.assert_close(previous, saved)

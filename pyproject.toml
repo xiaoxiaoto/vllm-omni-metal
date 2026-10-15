@@ -27,6 +27,14 @@ metal = "vllm_omni_metal:register_platform"
 [tool.setuptools.packages.find]
 include = ["vllm_omni_metal*"]
 
+[tool.setuptools.package-data]
+vllm_omni_metal = [
+    "_native/metal/*.h",
+    "_native/pytorch_backend/*.mm",
+    "_native/*.metal",
+    "_native/*.md",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["integration: real MPS engine tests (set VLLM_OMNI_METAL_INTEGRATION=1)"]

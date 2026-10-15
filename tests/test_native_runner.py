@@ -333,15 +333,72 @@ def test_prepare_and_sparse_sampler_on_default_mps_device(runner):
     assert result.inter_stage_outputs[1]["model_outputs"].tolist() == [7.0]
 
 
+class NativeKernelTestHooks:
+    """Worker extension keeps spies in the child without enabling unsafe RPC serialization."""
+
+    def install_test_kernel_spies(self, paged):
+        from vllm_omni_metal import activation, mps_attention
+
+        self._test_silu_calls = []
+        self._test_original_silu = activation._silu_and_mul_mps
+        self._test_original_sdpa = torch.nn.functional.scaled_dot_product_attention
+        self._test_original_mps_lookup = mps_attention.get_mps_ops
+        native = mps_attention.get_mps_ops()
+        self._test_native_available = native is not None
+        self._test_torch_attention_calls = 0
+
+        class ObservedLauncher:
+            def forward(observer, *args):
+                self._test_torch_attention_calls += 1
+                return native.forward(*args)
+
+        mps_attention.get_mps_ops = lambda: ObservedLauncher() if native is not None else None
+
+        def spy_compiled_silu(x):
+            self._test_silu_calls.append(tuple(x.shape))
+            return self._test_original_silu(x)
+
+        def forbid_mps_sdpa(query, *args, **kwargs):
+            if query.device.type == "mps":
+                raise AssertionError("supported geometry must use upstream paged kernels")
+            return self._test_original_sdpa(query, *args, **kwargs)
+
+        activation._silu_and_mul_mps = spy_compiled_silu
+        if paged:
+            torch.nn.functional.scaled_dot_product_attention = forbid_mps_sdpa
+
+    def get_test_silu_calls(self):
+        return self._test_silu_calls
+
+    def get_test_torch_attention_calls(self):
+        return self._test_torch_attention_calls, self._test_native_available
+
+    def restore_test_kernel_spies(self):
+        from vllm_omni_metal import activation, mps_attention
+
+        if hasattr(self, "_test_original_silu"):
+            activation._silu_and_mul_mps = self._test_original_silu
+            mps_attention.get_mps_ops = self._test_original_mps_lookup
+            torch.nn.functional.scaled_dot_product_attention = self._test_original_sdpa
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     os.getenv("VLLM_OMNI_METAL_INTEGRATION") != "1" or not is_available(),
     reason="requires Apple Silicon and explicit integration opt-in",
 )
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-@pytest.mark.parametrize("head_size,dtype", [(8, "float32"), (64, "float32"), (64, "bfloat16")])
+@pytest.mark.parametrize(
+    "head_size,dtype,large_mlp",
+    [
+        (8, "float32", False),
+        (64, "float32", False),
+        (64, "bfloat16", False),
+        (64, "bfloat16", True),
+    ],
+)
 def test_two_native_language_architectures_on_mps(
-    tmp_path, architecture, head_size, dtype, monkeypatch
+    tmp_path, architecture, head_size, dtype, large_mlp
 ):
     from transformers import LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM
     from vllm import LLM
@@ -352,7 +409,7 @@ def test_two_native_language_architectures_on_mps(
     config = config_cls(
         vocab_size=64,
         hidden_size=4 * head_size,
-        intermediate_size=8 * head_size,
+        intermediate_size=8192 if large_mlp else 8 * head_size,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -360,9 +417,14 @@ def test_two_native_language_architectures_on_mps(
         bos_token_id=1,
         eos_token_id=2,
     )
+    # Qwen3Config may declare a head_dim independent of hidden_size / num_attention_heads.
+    actual_head_size = getattr(config, "head_dim", None) or head_size
+    paged_geometry = actual_head_size in (64, 96, 128, 256, 512)
     reference = model_cls(config).to(getattr(torch, dtype)).eval()
     reference.save_pretrained(tmp_path)
     prompts = [[3, 4, 5], [9, 10]]
+    if large_mlp:
+        prompts = [[3, 4, 5, 6] * 8, [9, 10, 11, 12] * 8]
     expected = []
     with torch.inference_mode():
         for prompt in prompts:
@@ -371,18 +433,11 @@ def test_two_native_language_architectures_on_mps(
                 logits = reference(torch.tensor([tokens])).logits[0, -1]
                 tokens.append(int(logits.argmax()))
             expected.append(tokens[len(prompt) :])
-    if head_size == 64:
-        sdpa = torch.nn.functional.scaled_dot_product_attention
 
-        def forbid_mps_sdpa(query, *args, **kwargs):
-            if query.device.type == "mps":
-                raise AssertionError("supported geometry must use upstream paged kernels")
-            return sdpa(query, *args, **kwargs)
-
-        monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", forbid_mps_sdpa)
     llm = LLM(
         model=str(tmp_path),
         worker_cls="vllm_omni_metal.native_worker.MetalARWorker",
+        worker_extension_cls=f"{__name__}.NativeKernelTestHooks",
         distributed_executor_backend="uni",
         dtype=dtype,
         enforce_eager=True,
@@ -394,6 +449,8 @@ def test_two_native_language_architectures_on_mps(
         num_gpu_blocks_override=32,
     )
     try:
+        # Parent monkeypatches do not reach the spawned engine worker.
+        llm.collective_rpc("install_test_kernel_spies", args=(paged_geometry,), timeout=20)
         priorities = llm.llm_engine.vllm_config.kernel_config.ir_op_priority
         assert priorities.rms_norm == priorities.fused_add_rms_norm == ["omni_mps", "native"]
         output = llm.generate(
@@ -402,6 +459,14 @@ def test_two_native_language_architectures_on_mps(
             use_tqdm=False,
         )
         assert [result.outputs[0].token_ids for result in output] == expected
+        (compiled_calls,) = llm.collective_rpc("get_test_silu_calls", timeout=20)
+        assert bool(compiled_calls) is large_mlp
+        ((native_calls, native_available),) = llm.collective_rpc(
+            "get_test_torch_attention_calls", timeout=20
+        )
+        assert bool(native_calls) is (paged_geometry and native_available)
+        if large_mlp:
+            assert all(shape[-1] == 16384 for shape in compiled_calls)
         params = SamplingParams(
             temperature=0.7, seed=42, max_tokens=6, ignore_eos=True, detokenize=False
         )
@@ -411,4 +476,7 @@ def test_two_native_language_architectures_on_mps(
         solo = llm.generate({"prompt_token_ids": prompts[0]}, params, use_tqdm=False)
         assert batch[0].outputs[0].token_ids == solo[0].outputs[0].token_ids
     finally:
-        llm.llm_engine.engine_core.shutdown()
+        try:
+            llm.collective_rpc("restore_test_kernel_spies", timeout=20)
+        finally:
+            llm.llm_engine.engine_core.shutdown()
