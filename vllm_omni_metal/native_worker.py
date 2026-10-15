@@ -164,6 +164,9 @@ class MetalNativeWorker(OmniWorkerMixin, WorkerBase):
 
     def shutdown(self):
         if self.model_runner is not None:
+            close = getattr(self.model_runner.model, "close_metal_operators", None)
+            if callable(close):
+                close()
             self.model_runner.shutdown_omni_connectors()
             self.model_runner.requests.clear()
             self.model_runner.model = None

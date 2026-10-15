@@ -33,6 +33,10 @@ vllm_omni_metal = [
     "_native/pytorch_backend/*.mm",
     "_native/*.metal",
     "_native/*.md",
+    "_native/ane/*.cc",
+    "_native/ane/*.h",
+    "_native/ane/*.swift",
+    "_native/ane/LICENSE",
 ]
 
 [tool.pytest.ini_options]

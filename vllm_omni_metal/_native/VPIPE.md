@@ -3,8 +3,11 @@
 Source: <https://github.com/tgo-app-dev/vpipe/tree/6a721d5c3b74ded70001f7c02121f14ae8f5321a>
 
 License: Apache-2.0 (the same full license is distributed at this project's root).
-Only independent kernels from `gpu-kernels/metal/ops/llm_elementwise.metal` and
-`gpu-kernels/metal/ops/rope.metal` are included. No bundled media/model components,
+Independent kernels from `gpu-kernels/metal/ops/llm_elementwise.metal` and
+`gpu-kernels/metal/ops/rope.metal`, plus the standalone CoreML ANE emitter from
+`apple-silicon/coreml/ane-emitter.cc`, are included. The emitter/Swift bridge is
+adapted under `_native/ane/`; its manager-dependent self-test was removed and the
+C ABI/host tool owns integrity checks. No bundled media/model components,
 MLX steel headers, GPL libraries, or model-specific fusions are copied.
 
 `vpipe_elementwise.metal` is **adapted**, not an unchanged source snapshot:
@@ -28,4 +31,5 @@ Missing artifacts retain the original paths; invalid artifacts fail explicitly.
 
 Not ported: model-specific Gemma post-norm residual addition, frequency-recomputing
 RoPE, projection/gate packing, sliding ring KV writes, quantization, video attention,
+model-specific ANE worker/controller or online scheduler,
 and M5-only NAX kernels. They do not match this plugin's current contracts/hardware.

@@ -6,6 +6,8 @@
 
 目前可执行原生 `LLM_AR` 和 `LLM_GENERATION`，以及原有完整 generation / Diffusers pipeline。支持范围限单卡、`uni`、同步调度、未量化 dense decoder；这不是任意 CUDA/Triton 模型或所有 Omni 功能的移植。
 
+通用 dense SwiGLU 的 GPU + ANE 合作 contract、显式 CoreML 准备、完整 pipeline 校准和 FP16 误差边界见[独立协议](ane.md)。该路径不替代完整模型适配入口；未知形状、设备或校准配置保留 GPU。
+
 ## 原生阶段
 
 ### Worker 与配置

@@ -82,6 +82,16 @@ source ~/.venv-vllm-omni-metal/bin/activate
 
 这是本地显式构建，不升级依赖、不安装工具、不修改上游 package 或当前服务。产物在用户私有 `~/.cache/vllm-omni-metal/mps/`，绑定源码、Torch 环境与 Python ABI；构建后新 worker 的支持域 FP32/FP16/BF16 attention 使用 Torch stream，缺少匹配产物仍走 bridge；FP32 prefill 不使用仅支持 half/bfloat 的 tiled shader。引擎启动/请求处理不触发编译；环境或插件源码改变后需重建并在正常服务维护流程下启动新 worker。本次在开发环境及全新 `/tmp` 私有安装器环境完成真实 source install、CLI、pipcheck 和显式 host launcher 编译；Homebrew/curl 新入口仍未完整验收，不覆盖已有安装/服务；详见[执行合同](generic-backend.md#可选-torch-stream-attention)。
 
+## 可选：GPU + ANE CoreML host 工具
+
+普通安装只安装代码和 Apache-2.0 emitter/bridge 源码；不需要 CoreML Python wheel，也不编译工具。用户可在安装时显式选择 `./install.sh --with-ane`，或之后在所选隔离环境运行：
+
+```bash
+.venv-vllm-omni-metal/bin/python -m vllm_omni_metal.ane_build --bridge
+```
+
+需要现有 Apple Command Line Tools（clang++/Swift）及 macOS 15+；没有时明确失败，不下载工具。Homebrew 命令见 Formula caveats。该步骤只构建 host 工具，不下载/转换模型，也不代表 ANE 可用；模型适配器还须显式准备权重图并以完整 pipeline 延迟批准 profile。默认 auto 无匹配 profile 时保留 GPU，FP16 近似精度、生命周期及已知 5.18% 音频差异见 [GPU + ANE 协议](ane.md)。没有在当前已安装/运行的环境中重启或发布验证。
+
 ## 可选：vpipe 源算子 metallib
 
 ```bash

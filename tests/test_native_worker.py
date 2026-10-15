@@ -81,6 +81,24 @@ def test_native_config_rejects_conflicting_activation_directives(config, operati
         MetalPlatform.check_and_update_config(config)
 
 
+def test_shutdown_closes_model_operator_resources_before_connectors(monkeypatch):
+    calls = []
+    worker = object.__new__(MetalNativeWorker)
+    worker.model_runner = SimpleNamespace(
+        model=SimpleNamespace(close_metal_operators=lambda: calls.append("operators")),
+        shutdown_omni_connectors=lambda: calls.append("connectors"),
+        requests={"request": 1},
+    )
+    worker.compilation_config = SimpleNamespace(static_forward_context={"layer": 1})
+    monkeypatch.setattr(MetalOmniPlatform, "empty_cache", lambda: None)
+    worker.shutdown()
+    assert calls == ["operators", "connectors"]
+    assert worker.model_runner.model is None and not worker.model_runner.requests
+    assert not worker.compilation_config.static_forward_context
+    worker.shutdown()
+    assert calls == ["operators", "connectors", "connectors"]
+
+
 def test_kv_memory_reserves_host_headroom_and_respects_explicit_budget(config, monkeypatch):
     gib = 1024**3
     worker = object.__new__(MetalNativeWorker)

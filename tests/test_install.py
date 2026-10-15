@@ -147,6 +147,45 @@ def test_plugin_version_matches_omni_and_source_fallback(monkeypatch):
     assert source["__version__"] == project["version"]
 
 
+@pytest.mark.parametrize("piped", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_optional_ane_build_is_explicit_and_uses_private_python(installer, tmp_path, piped, fail):
+    run, log = installer
+    venv = tmp_path / "ane env"
+    assert run("--venv", str(venv), piped=piped).returncode == 0
+    module_log = tmp_path / "module-call"
+    (venv / "bin/python").write_text(
+        '#!/bin/sh\nif [ "$1" = "-m" ]; then\n'
+        f'  printf "%s\\n" "$@" > "{module_log}"\n'
+        f"  exit {7 if fail else 0}\nfi\nexit 0\n"
+    )
+    result = run("--venv", str(venv), "--with-ane", piped=piped)
+    assert result.returncode == (7 if fail else 0)
+    assert module_log.read_text().splitlines() == ["-m", "vllm_omni_metal.ane_build", "--bridge"]
+    if fail:
+        assert "安装完成" not in result.stdout
+    else:
+        assert "默认 auto" in result.stdout and "启动和请求期间不编译" in result.stdout
+
+
+def test_ane_sources_are_packaged_and_formula_does_not_compile_implicitly():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    assets = project["tool"]["setuptools"]["package-data"]["vllm_omni_metal"]
+    for pattern in (
+        "_native/ane/*.cc",
+        "_native/ane/*.h",
+        "_native/ane/*.swift",
+        "_native/ane/LICENSE",
+    ):
+        assert pattern in assets
+        assert list((ROOT / "vllm_omni_metal").glob(pattern))
+    formula = (ROOT / "Formula/vllm-omni-metal.rb").read_text()
+    assert '"vllm_omni_metal.ane_build", "--help"' in formula
+    assert (
+        'system libexec/"bin/python", "-m", "vllm_omni_metal.ane_build", "--bridge"' not in formula
+    )
+
+
 def test_formula_and_script_pins_match():
     script = (ROOT / "install.sh").read_text()
     formula = (ROOT / "Formula/vllm-omni-metal.rb").read_text()

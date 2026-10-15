@@ -67,6 +67,13 @@ class VllmOmniMetal < Formula
 
       Python and all backends are installed in a private libexec environment.
       No environment activation is needed. The existing vllm command is unchanged.
+
+      GPU+ANE defaults to auto, requiring explicitly prepared weights and a
+      whole-pipeline profile with >=3% latency reduction; otherwise GPU is kept.
+      Prepare host tools explicitly (requires existing Apple Command Line Tools):
+        #{libexec}/bin/python -m vllm_omni_metal.ane_build --bridge
+      Model adapters must separately approve approximate FP16 math and prepare
+      weight graphs/calibration. No startup/request compilation or model downloads.
     EOS
   end
 
@@ -75,6 +82,10 @@ class VllmOmniMetal < Formula
       from importlib.metadata import entry_points, version
       import torch
       from vllm_omni_metal import is_available
+      from vllm_omni_metal.ane import DenseSwiGLU, execution_scope
+      from importlib.resources import files
+      for name in ('ane-emitter.cc', 'ane-emitter.h', 'emit.cc', 'bridge.swift', 'LICENSE'):
+          assert files('vllm_omni_metal').joinpath('_native/ane', name).is_file(), name
       assert version('vllm') == '0.31.0+cpu'
       assert version('vllm-metal') == '0.31.0'
       assert version('vllm-omni') == '0.31.0.dev0+cpu'
@@ -84,6 +95,7 @@ class VllmOmniMetal < Formula
       assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'
                  for e in entry_points(group='vllm_omni.platform_plugins'))
     PYTHON
+    system libexec/"bin/python", "-m", "vllm_omni_metal.ane_build", "--help"
     system bin/"vllm-omni", "--help"
   end
 end

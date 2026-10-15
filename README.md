@@ -55,6 +55,8 @@ Apple M4 Pro、BF16、4×4096、30 次同步计时：普通 RMSNorm 0.182 → 0.
 
 M4 Pro、BF16、32×8192、30 次同步中位数：原生 0.343 → 编译路径 0.170 ms（约 **2.0×**），包含 OOT dispatch、桥接和同步。小块桥接收益不稳定，因此不默认优化小 decode。随机大 MLP Llama/Qwen3 已确认真实 worker 命中新路径、greedy 与 seed 回归通过；这仍不是整模型吞吐结果。可选缓存表 NeoX RoPE 的 vpipe 移植及限制见下节；隔离算子验证不等于默认 worker 已启用。
 
+GPU + ANE 合作提供独立、通用的 dense SwiGLU contract；默认 auto 只消费绑定源码/设备/权重/完整 pipeline 配置的离线校准，缺少匹配准备产物即保留 GPU，不在 worker/request 编译。FP16 math 必须由外部模型适配器显式选择，不是 BF16 等价替代；本插件不接管模型 registry 或捆绑 YuE2 实现。准备和误差限制见 [GPU + ANE 协议](docs/ane.md)。尚未做本次 real-model 安装/整流水线复验，不能宣称端到端默认加速。
+
 第四阶段提供可选 **纯 Torch-stream paged attention**：复用已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的 host launcher 和已安装的 0.31 shader。固定 wheel 缺少该 launcher，因此需在选定环境中显式编译一次（Apple Command Line Tools）；host adapter 仅补齐已发布 FP32 shader 的 dtype/路由选择，不升级依赖、不写 attention shader、不修改上游安装，运行时不自动编译。
 
 ```bash

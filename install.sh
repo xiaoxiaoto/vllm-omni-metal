@@ -18,16 +18,19 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   fi
 fi
 venv="${source_dir:-$HOME}/.venv-vllm-omni-metal"
+with_ane=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --venv)
       [[ $# -ge 2 && -n "$2" ]] || { echo '--venv 需要路径' >&2; exit 1; }
       venv="$2"; shift 2 ;;
+    --with-ane) with_ane=true; shift ;;
     -h|--help)
-      printf '%s\n' '用法：install.sh [--venv PATH]' \
+      printf '%s\n' '用法：install.sh [--venv PATH] [--with-ane]' \
         '安装匹配的 vLLM CPU / vllm-metal 0.31.0 wheel、Omni CPU 包和本插件。' \
         '源码运行默认创建 .venv-vllm-omni-metal（editable）；curl 运行创建 ~/.venv-vllm-omni-metal。' \
-        '不修改系统 Python、Homebrew libexec、已有 .venv 或运行中的服务。'
+        '不修改系统 Python、Homebrew libexec、已有 .venv 或运行中的服务。' \
+        '--with-ane 显式离线构建 CoreML host 工具；不下载工具/权重，不自动转换模型或校准。'
       exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 1 ;;
   esac
@@ -83,6 +86,10 @@ uv pip check --python "$python"
 from importlib.metadata import entry_points, version
 import torch
 from vllm_omni_metal import is_available
+from vllm_omni_metal.ane import DenseSwiGLU, execution_scope
+from importlib.resources import files
+for name in ('ane-emitter.cc', 'ane-emitter.h', 'emit.cc', 'bridge.swift', 'LICENSE'):
+    assert files('vllm_omni_metal').joinpath('_native/ane', name).is_file(), name
 assert version('vllm') == '0.31.0+cpu'
 assert version('vllm-metal') == '0.31.0'
 assert version('vllm-omni') == '0.31.0.dev0+cpu'
@@ -92,4 +99,8 @@ assert torch.Generator(device='mps') is not None
 assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'
            for e in entry_points(group='vllm_omni.platform_plugins'))
 PY
+if [[ "$with_ane" == true ]]; then
+  "$python" -m vllm_omni_metal.ane_build --bridge
+fi
+printf '\nGPU+ANE 默认 auto：无匹配权重图/整流水线校准则保留 GPU。显式准备 host 工具：\n  "%s" -m vllm_omni_metal.ane_build --bridge\n模型权重图及 FP16 近似精度批准由独立适配器准备；启动和请求期间不编译。\n' "$python"
 printf '\n安装完成。激活环境：\n  source "%s/bin/activate"\n或直接运行：\n  "%s/bin/vllm-omni" serve /path/to/model --omni --deploy-config /path/to/metal-profile.yaml\n' "$venv" "$venv"
