@@ -217,6 +217,167 @@ def cached_neox_rope_qk(query, key, selected_cache, head_size):
     return out_q, out_k
 
 
+def supports_separate_silu(gate, up):
+    """Existing AOT SwiGLU also supports independent, contiguous allocations."""
+    return (
+        gate.device.type == "mps"
+        and gate.dtype in _SCALARS
+        and up.device == gate.device
+        and up.dtype == gate.dtype
+        and up.shape == gate.shape
+        and gate.is_contiguous()
+        and up.is_contiguous()
+        and not gate.is_neg()
+        and not up.is_neg()
+        and not gate.requires_grad
+        and not up.requires_grad
+        and 0 < gate.numel() < 2**31
+        and _library(gate.dtype) is not None
+    )
+
+
+def separate_silu_mul(gate, up):
+    """Launch separate-input SwiGLU without concatenating large projections."""
+    if not supports_separate_silu(gate, up):
+        raise ValueError("unsupported separate SiLU inputs or missing AOT artifact")
+    result = torch.empty_like(gate)
+    _library(gate.dtype).swiglu_f16(gate, up, result, gate.numel(), threads=gate.numel())
+    return result
+
+
+def _diffusion_source():
+    return Path(__file__).parent / "_native/diffusion_rotary.metal"
+
+
+def _diffusion_artifact_path(dtype):
+    digest = hashlib.sha256(Path(__file__).read_bytes() + _diffusion_source().read_bytes())
+    digest.update(str(torch.__version__).encode())
+    digest.update(str(Path(torch.__file__).resolve()).encode())
+    return (
+        Path.home()
+        / ".cache/vllm-omni-metal/diffusion"
+        / digest.hexdigest()
+        / f"{_SCALARS[dtype]}.metallib"
+    )
+
+
+@cache
+def _diffusion_library(dtype):
+    path = _diffusion_artifact_path(dtype)
+    if not path.exists() and not path.is_symlink():
+        return None
+    _check_artifact(path)
+    return torch.mps.load_metallib(path)
+
+
+def build_diffusion_kernels():
+    """Explicit offline preparation; requires the already installed Metal compiler.
+
+    Ordinary installation packages shader source only. Workers only load matching
+    artifacts and never call this builder or ``compile_shader``.
+    """
+    if (
+        psutil.virtual_memory().available < 3 * 1024**3
+        or shutil.disk_usage(Path.home()).free < 512 * 1024**2
+    ):
+        raise RuntimeError("diffusion build budget requires 3 GiB headroom and 512 MiB disk")
+    if not shutil.which("xcrun"):
+        raise RuntimeError("diffusion build requires an already installed Apple Metal compiler")
+    found = subprocess.run(["xcrun", "--find", "metal"], capture_output=True, text=True, timeout=5)
+    if found.returncode:
+        raise RuntimeError("Apple Metal compiler unavailable; no tools are installed automatically")
+    for dtype, scalar in _SCALARS.items():
+        path = _diffusion_artifact_path(dtype)
+        for directory in (path.parent.parent.parent, path.parent.parent, path.parent):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _check_private_directory(directory)
+        with (path.parent / "build.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if path.exists() or path.is_symlink():
+                _check_artifact(path)
+                continue
+            with tempfile.TemporaryDirectory(prefix="build-", dir=path.parent) as temporary:
+                source = Path(temporary) / "ops.metal"
+                air = Path(temporary) / "ops.air"
+                target = Path(temporary) / "ops.metallib"
+                source.write_text(
+                    f"#define DIFFUSION_ELT {scalar}\n" + _diffusion_source().read_text()
+                )
+                subprocess.run(
+                    [
+                        "xcrun",
+                        "metal",
+                        "-std=metal3.1",
+                        "-fno-fast-math",
+                        "-c",
+                        str(source),
+                        "-o",
+                        str(air),
+                    ],
+                    check=True,
+                    timeout=60,
+                )
+                subprocess.run(
+                    ["xcrun", "metallib", str(air), "-o", str(target)], check=True, timeout=60
+                )
+                os.replace(target, path)
+    _diffusion_library.cache_clear()
+    return _diffusion_artifact_path(torch.float16).parent
+
+
+def supports_interleaved_rotary(x, freqs):
+    return (
+        x.device.type == "mps"
+        and x.dtype in _SCALARS
+        and x.ndim == 4
+        and x.shape[-1] > 0
+        and x.shape[-1] % 2 == 0
+        and 0 < x.numel() < 2**31
+        and x.is_contiguous()
+        and not x.is_neg()
+        and not x.requires_grad
+        and freqs.device == x.device
+        and freqs.dtype == torch.complex64
+        and freqs.is_contiguous()
+        and not freqs.is_conj()
+        and not freqs.is_neg()
+        and not freqs.requires_grad
+        and (
+            freqs.shape == (x.shape[1], x.shape[-1] // 2)
+            or freqs.shape == (1, x.shape[1], x.shape[-1] // 2)
+            or freqs.shape == (x.shape[0], x.shape[1], x.shape[-1] // 2)
+        )
+        and _diffusion_library(x.dtype) is not None
+    )
+
+
+def interleaved_rotary(x, freqs):
+    """AOT FP32-complex multiply with adjacent pairs and a final dtype cast."""
+    if not supports_interleaved_rotary(x, freqs):
+        raise ValueError("unsupported interleaved rotary inputs or missing AOT artifact")
+    result = torch.empty_like(x)
+    _diffusion_library(x.dtype).interleaved_rotary(
+        x,
+        torch.view_as_real(freqs),
+        result,
+        (
+            x.shape[1],
+            x.shape[2],
+            x.shape[3] // 2,
+            x.numel() // 2,
+            int(freqs.ndim == 3 and freqs.shape[0] != 1),
+        ),
+        threads=x.numel() // 2,
+    )
+    return result
+
+
 if __name__ == "__main__":
-    argparse.ArgumentParser(description=__doc__).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--diffusion", action="store_true", help="Also prepare interleaved diffusion RoPE"
+    )
+    args = parser.parse_args()
     print(build_vpipe_kernels())
+    if args.diffusion:
+        print(build_diffusion_kernels())

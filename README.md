@@ -21,6 +21,8 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 原生 generation pipeline 的 diffusion SDPA 通过本插件的 `MetalSDPABackend` 进入上游通用 Torch 实现，避免上游 `AttentionImpl.forward` 缺少 OOT 平台分派而报 `No forward implementation for platform`；不改变模型 registry、采样或上游 attention 类。mask、GQA、causal、scale 与布局的真实 MPS 数值回归见 `tests/test_diffusion_attention.py` 和[执行合同](docs/generic-backend.md)。
 
+`diffusion_ops.py` 另提供显式、通用的 Diffusers RMSNorm、独立 gate/up SwiGLU、interleaved complex RoPE，复用 MPS fused norm、已有 MLX bridge 与可选 Torch-stream AOT。它们不会全局改写上游模型，需独立适配器接入；不是把 AR 分页 KV／NeoX 算子直接套给 diffusion。`TiledDenseSwiGLU` 保持原256MiB与1%门槛，支持一般大 inner 的有界分片。QwenImage 私有适配已完成小算子、生命周期和真实单层权重验证，但完整图片 A/B 受内存门禁、生产 AOT 受完整 Xcode 缺失阻塞；不能宣称整模型已提速或默认 ANE 已启用。见[diffusion 合同](docs/generic-backend.md#diffusion-显式算子接入)和[分片 ANE](docs/ane.md#有界-inner-分片独立-gateupdown)。
+
 原生 runner 已支持通用 `prepare_runner_inputs`（含 opt-in 请求级采样参数）、采样期间追加终结输出，以及按请求 ID 路由的稀疏音频输出。稀疏协议的非法 marker、重复/未知 ID 和列表长度不一致均拒绝传输；无输出的请求不会收到其他请求的音频或 hidden states。
 
 **随包未补丁 Omni 的 YuE2 仍未完成端到端 Metal 支持。** 其 CPU generator/MPS 张量不匹配和 CUDA pinned-memory/event 假设需要上游或独立模型适配，本插件不硬编码。独立 `yue2mps2` overlay 配合当前后端已完成真实512帧歌曲及 attention A/B，结果见[真实 YuE2 对照](docs/generic-backend.md#真实-yue2当前-torch-stream-attention-对照)；这不等于默认安装开箱可用。兼容性与升级边界见 [YuE2 接入状态](docs/yue2-readiness.md)。安装固定 Omni main 开发快照，不伪装稳定 release。

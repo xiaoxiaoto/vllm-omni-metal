@@ -30,6 +30,22 @@ Apple M4 Pro / 48 GiB、macOS 26.6.2（25G83），Torch 2.13.0、Transformers 5.
 
 通用 dense SwiGLU 的 GPU + ANE 合作 contract、显式 CoreML 准备、完整 pipeline 校准和 FP16 误差边界见[独立协议](ane.md)。该路径不替代完整模型适配入口；未知形状、设备或校准配置保留 GPU。
 
+## Diffusion 显式算子接入
+
+`diffusion_ops.py` 提供 `silu_mul(gate, up)`、`rms_norm(x, weight, eps)` 和 `rotary(x, complex_freqs)`，仅由适配器显式调用，不全局替换模型类或 registry。`use_optimizations(False)` 用局部 ContextVar 保留精确 Torch 基线；`metrics_snapshot()` 只计实际成功路径，缺 AOT 的 Torch 后备不计为融合命中。
+
+- SwiGLU 独立输入复用现有 vpipe `swiglu_f16` 或大输入 MLX bridge，避免大激活 `cat`；保留 SiLU FP32计算、cast后再乘up的舍入。
+- RMSNorm 遵守 Diffusers FP32 variance、根据weight dtype选择pre-affine cast的合同，不把vLLM的无条件cast规则混入。只在匹配域使用无learned-weight的Torch MPS fused norm，再按原顺序应用weight。
+- RoPE 为 adjacent real/imag、complex64／FP32乘法，既不是NeoX split-half，也不是低精度乘法逐项舍入。随包 `_native/diffusion_rotary.metal` 是独立AOT源码；`vpipe_kernels --diffusion` 显式准备，生产只加载匹配metallib，不在worker/request使用 `compile_shader`。
+- CPU、合法广播／混合dtype、非连续、梯度或其他不匹配输入保留原设备的原Torch数学路径；没有隐式转CPU。
+
+`MetalDiffusionWorker.shutdown()` 会调用pipeline可选的 `close_metal_operators()`，并在该钩子失败时仍释放上游runner、KV／offload及分布式资源，重复shutdown不重复关闭。私有pipeline负责持有不可变权重组及每请求作用域，不接管HTTP、采样或codec。
+
+QwenImage 接线在相邻部署的私有 Omni wheel：仅替换数学合同匹配的 FFN/RMSNorm/RoPE 入口，GPU开关保守默认off，ANE只消费完整生成校准的profile。通用代码未内置其模型名、层数、checkpoint路径或拓扑。AR paged-attention／分页KV、NeoX缓存表、add-before-RMSNorm不适用于其diffusion条件前缀／interleaved RoPE／LayerNorm，不以关闭检查来伪装兼容。
+
+当前新算子已通过CPU/MPS、舍入／布局／梯度边界及隔离shader回归；隔离编译不是生产AOT证据。本机缺完整Xcode，Apple官方工具链命令无法执行。真实QwenImage单层权重协同已通过1%数值门禁，完整生成A/B仍受32GiB available门禁阻塞；没有完整模型速度或默认ANE启用结论。安装、资源与真实权重记录见[安装说明](installation.md)和[分片ANE](ane.md)。
+
+
 ## 原生阶段
 
 ### Worker 与配置

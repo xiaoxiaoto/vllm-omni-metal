@@ -72,7 +72,7 @@ class VllmOmniMetal < Formula
       Prepare them explicitly with this libexec Python after installation:
         #{libexec}/bin/python -I -m vllm_omni_metal.mps_attention
         #{libexec}/bin/python -I -c 'from vllm_omni_metal.mps_attention import get_mps_ops; assert get_mps_ops() is not None'
-        #{libexec}/bin/python -I -m vllm_omni_metal.vpipe_kernels
+        #{libexec}/bin/python -I -m vllm_omni_metal.vpipe_kernels --diffusion
         #{libexec}/bin/python -I -m vllm_omni_metal.ane_build --bridge
       Attention and ANE host tools require existing Apple Command Line Tools.
       vpipe additionally requires an installed Apple Metal compiler; no tools
@@ -95,20 +95,21 @@ class VllmOmniMetal < Formula
       from importlib.metadata import entry_points, version
       import torch
       from vllm_omni_metal import is_available
-      from vllm_omni_metal.ane import DenseSwiGLU, execution_scope
+      from vllm_omni_metal.ane import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
       from importlib.resources import files
       import sys
       from pathlib import Path
       import vllm_omni_metal
       assert Path(vllm_omni_metal.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
       for module in ('mps_attention', 'vpipe_kernels', 'normalization', 'activation', 'rotary',
-                     'ane_build'):
+                     'ane_build', 'diffusion_ops'):
           import_module(f'vllm_omni_metal.{module}')
       for resource in (
           '_native/pytorch_backend/mps_ops.mm',
           '_native/metal/metal_device.h',
           '_native/metal/paged_attention_kernels.h',
           '_native/vpipe_elementwise.metal',
+          '_native/diffusion_rotary.metal',
           '_native/VPIPE.md',
           '_native/ane/ane-emitter.cc',
           '_native/ane/ane-emitter.h',

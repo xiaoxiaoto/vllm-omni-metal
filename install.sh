@@ -95,16 +95,17 @@ from importlib import import_module
 from importlib.metadata import entry_points, version
 import torch
 from vllm_omni_metal import is_available
-from vllm_omni_metal.ane import DenseSwiGLU, execution_scope
+from vllm_omni_metal.ane import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
 from importlib.resources import files
 for module in ('mps_attention', 'vpipe_kernels', 'normalization', 'activation', 'rotary',
-               'ane_build'):
+               'ane_build', 'diffusion_ops'):
     import_module(f'vllm_omni_metal.{module}')
 for resource in (
     '_native/pytorch_backend/mps_ops.mm',
     '_native/metal/metal_device.h',
     '_native/metal/paged_attention_kernels.h',
     '_native/vpipe_elementwise.metal',
+    '_native/diffusion_rotary.metal',
     '_native/VPIPE.md',
     '_native/ane/ane-emitter.cc',
     '_native/ane/ane-emitter.h',
@@ -127,7 +128,7 @@ if [[ "$with_mps_attention" == true ]]; then
   "$python" -I -c 'from vllm_omni_metal.mps_attention import get_mps_ops; assert get_mps_ops() is not None, "Torch-stream attention launcher 未加载"'
 fi
 if [[ "$with_vpipe" == true ]]; then
-  "$python" -I -m vllm_omni_metal.vpipe_kernels
+  "$python" -I -m vllm_omni_metal.vpipe_kernels --diffusion
 fi
 if [[ "$with_ane" == true ]]; then
   "$python" -I -m vllm_omni_metal.ane_build --bridge

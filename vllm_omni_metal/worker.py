@@ -20,6 +20,19 @@ class MetalDiffusionWorker(DiffusionWorker):
         if pipeline_runtime(self.od_config) == "torch":
             super().init_lora_manager()
 
+    def shutdown(self) -> None:
+        if getattr(self, "_shutdown_complete", False):
+            return
+        runner = getattr(self, "model_runner", None)
+        pipeline = getattr(runner, "pipeline", None)
+        close = getattr(pipeline, "close_metal_operators", None)
+        try:
+            if callable(close):
+                close()
+        finally:
+            # A private pipeline's failed cleanup must not leak shared process state.
+            super().shutdown()
+
 
 class MetalDiffusionModelRunner(DiffusionModelRunner):
     def load_model(

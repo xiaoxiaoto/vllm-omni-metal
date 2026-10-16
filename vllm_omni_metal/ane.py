@@ -200,9 +200,9 @@ class DenseSwiGLU:
                     )
                     self._runtime[hidden, inner] = bridge.load(path, hidden)
             self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omni-ane")
-        except RuntimeError:
+        except BaseException as error:
             self.close()
-            if _benchmark:
+            if _benchmark or not isinstance(error, RuntimeError):
                 raise
             self._closed = False
             logger.exception("ANE graph loading failed; retaining native GPU")
@@ -391,6 +391,237 @@ class DenseSwiGLU:
                 self._bridge.lib.ffn_unload(handle)
         self._handles.clear()
         self._runtime.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+class TiledDenseSwiGLU:
+    """A bounded group of separate gate/up/down projections, tiled along inner.
+
+    The owning adapter supplies native(x), its original *whole* FFN, on every
+    call. Off, native precision, missing approval and any failed tile use that
+    callable unchanged. Explicit offline benchmarking gates the final FP32 sum,
+    not just individual projections. Bind only the layers permitted by the
+    adapter's resource policy; no model-wide packed weight copy is required.
+    """
+
+    def __init__(self, weights, *, scope, precision="native", _benchmark=False):
+        self.weights = tuple(tuple(layer) for layer in weights)
+        self.shapes = [artifacts.tiled_weight_shape(*layer) for layer in self.weights]
+        self.scope, self.precision = scope, precision
+        if precision not in ("native", "fp16"):
+            raise ValueError("ANE precision must be native or explicitly fp16")
+        mode = os.environ.get("VLLM_OMNI_METAL_ANE", "auto")
+        if mode not in ("auto", "off"):
+            raise ValueError("VLLM_OMNI_METAL_ANE must be auto or off")
+        # Validate scope even for an inactive group; never share anonymous approval.
+        artifacts.group_key([], scope)
+        self.metrics = Counter()
+        self._tile_metrics = {}
+        self.checks = {}
+        self.profiles = {}
+        self._input_shapes = {}
+        self.plans = []
+        self.keys = []
+        self.identity = None
+        self.disabled = False
+        self._closed = False
+        self._benchmark = _benchmark
+        self._benchmark_chunks = 0
+        self._audit = True
+        self._group = None
+        self._versions = [DenseSwiGLU._version(layer) for layer in self.weights]
+        if mode == "off" or precision != "fp16" or not self.weights:
+            return
+        if not all(layer[0].dtype in (torch.float16, torch.bfloat16) for layer in self.weights):
+            return
+        if not all(layer[0].device.type == "mps" for layer in self.weights):
+            return
+        try:
+            self.plans = [artifacts.inner_tiles(*shape) for shape in self.shapes]
+        except ValueError:
+            return
+        artifacts.check_existing_cache()
+        root = artifacts.cache_root()
+        if not (root / "tools.json").exists() and not (root / "tools.json").is_symlink():
+            return
+        # Includes owned tiled copies plus the existing Dense/CoreML allowance.
+        required = 3 * sum(
+            value.numel() * value.element_size() for layer in self.weights for value in layer
+        )
+        if psutil.virtual_memory().available < artifacts.RESERVE + required:
+            if _benchmark:
+                raise RuntimeError("tiled ANE group exceeds system memory headroom")
+            return
+        # Hash sequential CPU tiles, not a second packed copy of every model layer.
+        self.keys = [
+            artifacts.weight_key(*pair)
+            for pair in artifacts.tiled_weights(self.weights, self.plans, host=True)
+        ]
+        self.identity = artifacts.tiled_group_key(self.keys, self.shapes, self.plans, scope)
+        if not _benchmark:
+            path = root / f"{self.identity}.json"
+            if not path.exists() and not path.is_symlink():
+                return
+            policy = artifacts.read_json(path)
+            if policy.get("group") != self.identity:
+                raise RuntimeError("ANE policy does not match the immutable tiled FFN group")
+            self.profiles, self._input_shapes = artifacts.validate_tiled_profiles(
+                policy.get("profiles"), self.shapes, self.plans
+            )
+            if not any(self.profiles.values()):
+                return
+        group = None
+        try:
+            group = DenseSwiGLU(
+                artifacts.tiled_weights(self.weights, self.plans),
+                scope=scope,
+                precision="fp16",
+                _benchmark=True,
+            )
+            if group._pool is None or group.disabled:
+                raise RuntimeError("tiled ANE group is not fully prepared")
+            if group.keys != self.keys:
+                raise RuntimeError("SwiGLU weights changed during tiled ANE binding")
+            if not _benchmark and policy.get("device") != group._bridge.device:
+                raise RuntimeError("ANE policy belongs to another device")
+            self._group = group
+        except BaseException as error:
+            if group is not None:
+                group.close()
+            if _benchmark or not isinstance(error, FileNotFoundError):
+                raise
+            logger.info("Prepared tiled ANE artifacts are missing; retaining native GPU")
+
+    @property
+    def _bridge(self):
+        return None if self._group is None else self._group._bridge
+
+    @property
+    def tile_metrics(self):
+        """Per-layer/tile hit evidence; final-output errors are in checks."""
+        return self._tile_metrics
+
+    def __call__(self, index, x, *, native, context=None):
+        if torch.is_grad_enabled():
+            raise RuntimeError("TiledDenseSwiGLU requires an inference/no-grad context")
+        if self._closed:
+            raise RuntimeError("TiledDenseSwiGLU group is closed")
+        if type(index) is not int or not 0 <= index < len(self.weights):
+            raise ValueError("invalid dense FFN index")
+        if context is not None and (type(context) is not int or not 0 <= context < 2**31):
+            raise ValueError("pipeline context must be a bounded nonnegative shape qualifier")
+        if self.disabled or self._group is None:
+            self.metrics["native_calls"] += 1
+            return native(x)
+        gate = self.weights[index][0]
+        if (
+            x.ndim not in (2, 3)
+            or x.shape[-1] != self.shapes[index][0]
+            or x.dtype != gate.dtype
+            or x.device != gate.device
+            or not x.is_contiguous()
+        ):
+            self.metrics["native_calls"] += 1
+            return native(x)
+        flat = x.reshape(-1, x.shape[-1])
+        rows = flat.shape[0]
+        chunks = (
+            self._benchmark_chunks if self._benchmark else self.profiles.get((rows, context), 0)
+        )
+        if chunks == 0 or rows <= artifacts.CHUNK:
+            self.metrics["native_calls"] += 1
+            return native(x)
+        if not self._benchmark and self._input_shapes.get(((rows, context), index)) != tuple(
+            x.shape
+        ):
+            self.metrics["native_calls"] += 1
+            return native(x)
+        if type(chunks) is not int or not 1 <= chunks <= (rows - 1) // artifacts.CHUNK:
+            raise ValueError("ANE must take complete chunks and GPU must retain a row")
+        if DenseSwiGLU._version(self.weights[index]) != self._versions[index]:
+            self._disable("weights were modified after tiled ANE binding")
+            return native(x)
+        # Account for the FP32 reduction and tile outputs without relaxing the reserve.
+        if psutil.virtual_memory().available < artifacts.RESERVE + flat.numel() * 12:
+            self._disable("system memory headroom exhausted")
+            return native(x)
+        if self._benchmark and not self._audit:
+            check = self.checks.get((index, rows, chunks, context))
+            if check is None or check["shape"] != list(x.shape):
+                raise RuntimeError("timed ANE execution requires a completed audit for this shape")
+        return self._execute(index, x, flat, chunks, native, context)
+
+    def _execute(self, index, x, flat, chunks, native, context):
+        rows = flat.shape[0]
+        offset = sum(len(plan) for plan in self.plans[:index])
+        try:
+            total = torch.zeros(flat.shape, dtype=torch.float32, device=flat.device)
+            for tile, _ in enumerate(self.plans[index]):
+                before = self._group.metrics.copy()
+                partial = self._group._split(offset + tile, flat, chunks)
+                hits = self._group.metrics.copy()
+                hits.subtract(before)
+                self._tile_metrics.setdefault((index, tile), Counter()).update(hits)
+                if self._group.disabled or hits["ane_chunks"] != chunks:
+                    raise RuntimeError("incomplete tiled ANE execution")
+                total.add_(partial)
+            result = total.to(x.dtype).reshape_as(x)
+            if not torch.isfinite(result).all():
+                raise RuntimeError("non-finite tiled output")
+        except BaseException as error:
+            self._disable(str(error))
+            if isinstance(error, (RuntimeError, ValueError)):
+                return native(x)
+            raise
+        if self._benchmark and self._audit:
+            expected = native(x)
+            rel, peak = _errors(result, expected)
+            key = index, rows, chunks, context
+            previous = self.checks.get(key, {})
+            if previous and previous["shape"] != list(x.shape):
+                self._disable("activation shape changed within one calibration key")
+                return expected
+            self.checks[key] = {
+                "relative_l2": max(rel, previous.get("relative_l2", 0)),
+                "scaled_max_abs": max(peak, previous.get("scaled_max_abs", 0)),
+                "tiles": len(self.plans[index]),
+                "shape": list(x.shape),
+            }
+            if rel > 0.01 or peak > 0.01:
+                self.metrics["numerical_rejections"] += 1
+                self._disable(f"final tiled numerical gate failed: rel={rel}, max={peak}")
+                return expected
+        self.metrics.update(calls=1, ane_chunks=chunks * len(self.plans[index]))
+        return result
+
+    def finish_audit(self):
+        """Freeze successful warmup evidence before measuring the production path."""
+        if not self._benchmark or self.disabled or self._closed or self._group is None:
+            raise RuntimeError("a healthy offline calibration group is required")
+        for index in range(len(self.weights)):
+            if not any(key[0] == index and key[2] == self._benchmark_chunks for key in self.checks):
+                raise RuntimeError("every FFN must be audited before timed execution")
+        self._audit = False
+
+    def _disable(self, reason):
+        self.disabled = True
+        self.close()
+        self._closed = False
+        self.metrics["failures"] += 1
+        logger.warning("Tiled ANE disabled: %s; retaining original GPU FFN", reason)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._group is not None:
+            self._group.close()
+            self._group = None
 
     def __enter__(self):
         return self

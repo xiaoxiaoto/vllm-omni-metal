@@ -48,7 +48,32 @@ with torch.inference_mode():
 group.close()
 ```
 
-权重绑定后必须不可变（包括 inference tensor 的 alias）；更换权重/device/dtype 必须关闭并重新绑定。普通 tensor 的版本变化会禁用协同。原生 worker 在关闭时调用模型可选的 `close_metal_operators()`，其余 facade 自行持有/释放。失败回 GPU 会改变算路，不承诺跨设备模式或故障前后同 seed 位等价；健康固定配置的复现应由模型适配器验证。
+权重绑定后必须不可变（包括 inference tensor 的 alias）；更换权重/device/dtype 必须关闭并重新绑定。普通 tensor 的版本变化会禁用协同。原生与 diffusion worker 在关闭时调用模型可选的 `close_metal_operators()`，其余 facade 自行持有/释放。失败回 GPU 会改变算路，不承诺跨设备模式或故障前后同 seed 位等价；健康固定配置的复现应由模型适配器验证。
+
+## 有界 inner 分片：独立 gate／up／down
+
+`TiledDenseSwiGLU` 为独立 gate、up、down 的 bias-free FFN 提供一般 inner 分片，不硬编码模型或增加原256MiB门槛。每片 inner 为1024倍数，按现有限制选择最大合格宽度；例如 hidden4096、inner12288 自动分为10240与2048。逐片准备／哈希，不先为全模型构造巨大的 packed 副本；运行时预算同时计入分片副本、CoreML 与 FP32 归约缓冲。适配器应只绑定资源允许的有限层。
+
+```python
+from vllm_omni_metal.ane import TiledDenseSwiGLU
+from vllm_omni_metal.ane_build import prepare_tiled_group
+
+# 只在显式离线准备阶段执行；原始 BF16 权重不被改写。
+weights = [(gate_weight, up_weight, down_weight)]
+prepare_tiled_group(weights, scope=complete_pipeline_scope)
+group = TiledDenseSwiGLU(weights, scope=complete_pipeline_scope, precision="fp16")
+with torch.inference_mode():
+    output = group(0, normalized_input, native=original_whole_ffn, context=request_geometry)
+group.close()
+```
+
+`native=` 必须是原始整 FFN。off、未批准、输入形状不符、资源或数值失败时原样调用它，不用分片 GPU 结果伪装无损基线。各子投影结果采用 FP32 累加后 cast；离线 `_benchmark=True` 模式还将最终合并结果与原整 FFN 对照，保留所有 warmup 步的最大相对L2／峰值归一误差，门槛仍各1%。
+
+离线候选完成真实生成 warmup 后调用 `finish_audit()`，冻结已通过的层／行数／context／完整激活形状。随后正式计时不额外重跑整 GPU FFN 或CPU FP64审核，避免把审计开销混入待测路径；出现未审核形状则明确拒绝，不能把它计为有效样本。`publish_tiled_profile` 只有在最终误差、每片实际命中、原3%整流水线收益门槛均满足时才批准，并将分片、权重、pipeline scope、数值与完整形状证据绑定到独立profile；默认 reader 再校验这些证据。原 `DenseSwiGLU` 的 API 和既有 profile 不变。
+
+2026-10-16，本机通过私有 QwenImage overlay 使用真实官方第0层4096→12288→4096 BF16权重，完成两片静态／runtime图数值自检及1024行小张量协同调用：每片256行ANE、768行GPU，最终相对L2 **0.297%**、峰值归一误差 **0.455%**，无重算或非有限值。图发布前通过CoreML每投影ANE preferred检查；没有采集Instruments硬件trace，没有发布整模型profile。输入是诊断张量，不是模型生成时的实际激活，不能据此宣称图片质量、完整生成速度或全部32层协同已通过。
+
+完整 QwenImage 真实生成校准在启动前被32GiB available门禁拒绝；继续需释放足够内存，不能提高MPS水位或关闭用户其他应用。证据与部署命令见相邻 `docker-compose/qwen-image-2.1-turbo/README.md`，本次最终源码／overlay的真实权重诊断记录在被忽略的 `outputs/qwenimage-real-ffn-20261016-final/`。本次适配保持在模型私有 wheel，不进入本后端 registry。
 
 ## 当前证据边界
 

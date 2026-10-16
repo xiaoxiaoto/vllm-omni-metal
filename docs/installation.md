@@ -38,6 +38,8 @@ python -m pip check
 
 默认不构建。构建失败即退出，不打印安装成功；不安装工具、不下载权重、不转换模型或校准。安装验证及构建以所选 Python 的 `-I` 隔离模式执行，忽略调用方 cwd/PYTHONPATH；模块 `--help` 和非法参数只解析参数，不触发构建。
 
+`--with-vpipe` 现在同时准备原vpipe算子和通用diffusion interleaved RoPE；手动命令为 `python -I -m vllm_omni_metal.vpipe_kernels --diffusion`。新 `diffusion_ops.py`、`TiledDenseSwiGLU` 和 `_native/diffusion_rotary.metal` 通过现有setuptools规则随源码、wheel与Formula分发，安装烟测检查其导入和资源存在，不修改上游模型registry。模型适配仍在独立部署的私有wheel中。
+
 安装器只接受新目录或它自己标记创建的环境，不接管任意已有 venv/Homebrew libexec，不使用 `--clear`。失败时保留环境和缓存供诊断、重试。依赖和插件在同一次 uv 解析中安装，保持 vllm-metal 声明的 mlx-lm Git URL 可见。
 
 总部署预检可以设置 `VLLM_OMNI_COMMIT=<完整 40 位 SHA>`，让安装器从查询到的官方 Omni 主干 commit 构建；省略时仍使用上述固定快照。非法 commit 会在安装前拒绝。开发版公开版本与 CPU 构建标记保持明确，不伪装稳定发布。
@@ -45,6 +47,10 @@ python -m pip check
 `docker-compose/start.sh` 的模型启动统一调用 `prepare_backend.py`：查询官方最新核心标签与 Omni main，构建独立后端，并从本仓库干净副本构建非 editable wheel。准备器显式选择 `--with-mps-attention`，在选定环境的全新 `-I` 进程中验证 launcher 能加载；源码/native资源、安装脚本及准备器内容均进入指纹，校验通过且构建期间指纹未变才写 `.ready` 并激活。YuE2 私有 overlay 在自己的解释器重复准备与加载验证，不能借基础环境的缓存冒充可用；已有 ready 也会重新验证，失败先撤销 ready。部署模型使用同一版本组，模型私有扩展不进入通用插件、不修改 Homebrew。新官方核心超出兼容矩阵时明确拒绝，不能逐包盲升。
 
 2026-10-16 通用 diffusion SDPA 的 Metal OOT 分派修复已通过上述共享准备器构建非 editable wheel 并完成 Qwen-Image-2.1-Turbo 真实文生图验收，详见[执行合同与本次命令](generic-backend.md#责任边界)。新增 `diffusion_attention.py` 由现有 setuptools 包发现与源码安装/Formula 自动包含，无须变更版本 pins 或 native 资源；源码指纹会触发新隔离后端。仅本地部署已安装，远端未推送，未运行 Homebrew/curl 安装。
+
+本次diffusion GPU／分片ANE接入使用共享准备器构建并安装非editable wheel，初次验证基础环境为 `runtime/4ce4b5b2ab413b98`、Omni main `90576488ae85de6ac355bb7aa3e9470c38303bba`；之后用户要求直接部署，根目录准备器联网更新至 Omni main `c8ccb8aed59e1db273d9dce6ee91b4f09d30db18`，部署使用 `runtime/a46a54e37c719e65` 与 QwenImage overlay `overlays/qwen-image-2.1-turbo/779257e7887353fb`。两个环境的依赖检查通过；最终部署版本完成统一入口真实512×512图片生成。依赖下载遇到TLS故障时使用 `UV_OFFLINE=true` 和已有兼容缓存，官方Git预检未跳过，未改核心pins或关闭TLS校验。
+
+生产AOT尚未构建：本机只有Command Line Tools，`xcrun --find metal`／`metallib`失败，Apple官方 `xcodebuild -downloadComponent metalToolchain` 因缺完整Xcode被拒绝。用户已允许安装工具链，但此入口缺少前置Xcode，未安装或下载工具、未重装Homebrew；隔离shader测试不代替AOT。真实QwenImage单层权重协同通过1%门禁，完整生成A/B被32GiB可用内存门禁拒绝，未发布整模型profile；详见[ANE记录](ane.md)。本次代码仍是本地工作区，不把它描述成已推送的远端入口。
 
 更新一个已使用的环境前，先停止所有使用它的服务。本次安装使用新的独立环境，保留运行中的 Higgs 及旧 Homebrew 环境；没有自动迁移服务。
 

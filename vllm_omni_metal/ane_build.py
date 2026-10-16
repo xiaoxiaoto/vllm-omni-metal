@@ -8,6 +8,7 @@ and benchmark their own unchanged pipeline before publishing a shape profile.
 import argparse
 import ctypes
 import fcntl
+import math
 import os
 import platform
 import shutil
@@ -289,6 +290,10 @@ def publish_profile(group, rows, baseline, candidates, *, context=None):
         raise ValueError(
             "every FFN must pass the unchanged live-input numerical gate before approval"
         )
+    return _store_profile(group, rows, record, context)
+
+
+def _store_profile(group, rows, record, context):
     root = artifacts.cache_root()
     with _lock(root):
         path = root / f"{group.identity}.json"
@@ -305,6 +310,81 @@ def publish_profile(group, rows, baseline, candidates, *, context=None):
             path, {"group": group.identity, "device": group._bridge.device, "profiles": profiles}
         )
     return record
+
+
+@torch.inference_mode()
+def prepare_tiled_group(weights, *, scope):
+    """Prepare separate gate/up/down matrices sequentially within existing limits.
+
+    Published individual graphs are immutable reusable assets, not approvals.
+    Failure leaves no partial graph directory or usable pipeline profile.
+    """
+    weights = tuple(tuple(layer) for layer in weights)
+    shapes = [artifacts.tiled_weight_shape(*layer) for layer in weights]
+    if not weights or any(
+        layer[0].dtype not in (torch.float16, torch.bfloat16) for layer in weights
+    ):
+        raise ValueError("ANE requires dense FP16/BF16 SwiGLU weights")
+    plans = [artifacts.inner_tiles(*shape) for shape in shapes]
+    artifacts.group_key([], scope)
+    if "VPIPE_ANE_SILU_OP" in os.environ:
+        raise ValueError("ANE preparation requires the verified stable SiLU graph")
+    largest = max(
+        6 * hidden * (end - start)
+        for (hidden, _), plan in zip(shapes, plans, strict=True)
+        for start, end in plan
+    )
+    _budget(sum(6 * h * n for h, n in shapes), memory=artifacts.RESERVE + 3 * largest)
+    root = build_tools()
+    bridge = _Bridge()
+    keys = []
+    with _lock(root):
+        for packed, down in artifacts.tiled_weights(weights, plans, host=True):
+            hidden, inner = artifacts.weight_shape(packed, down)
+            key = artifacts.weight_key(packed, down)
+            _emit_model(bridge, artifacts.runtime_key(hidden, inner), hidden, inner)
+            _emit_model(bridge, key, hidden, inner, packed, down)
+            keys.append(key)
+    return artifacts.tiled_group_key(keys, shapes, plans, scope)
+
+
+def publish_tiled_profile(group, rows, baseline, candidates, *, context=None):
+    """Approve only a healthy tiled group with final, live-input error evidence."""
+    from vllm_omni_metal.ane import TiledDenseSwiGLU
+
+    if not isinstance(group, TiledDenseSwiGLU):
+        raise ValueError("a tiled offline calibration group is required")
+    if not group._benchmark or group.disabled or group.identity is None or group._bridge is None:
+        raise ValueError("a healthy offline calibration group is required")
+    record = artifacts.select_profile(rows, baseline, candidates)
+    chosen = record["chunks"]
+    if chosen:
+        for index, plan in enumerate(group.plans):
+            check = group.checks.get((index, rows, chosen, context))
+            if (
+                not isinstance(check, dict)
+                or check.get("tiles") != len(plan)
+                or any(
+                    type(check.get(name)) not in (int, float)
+                    or not math.isfinite(check[name])
+                    or not 0 <= check[name] <= 0.01
+                    for name in ("relative_l2", "scaled_max_abs")
+                )
+                or any(
+                    group.tile_metrics.get((index, tile), {}).get("ane_chunks", 0) < chosen
+                    for tile in range(len(plan))
+                )
+            ):
+                raise ValueError("every tiled FFN must pass the final live-input 1% numerical gate")
+    record["numerical_checks"] = (
+        [dict(group.checks[index, rows, chosen, context]) for index in range(len(group.weights))]
+        if chosen
+        else []
+    )
+    artifacts.validate_tiled_profiles(
+        {artifacts.profile_label(rows, context): record}, group.shapes, group.plans
+    )
+    return _store_profile(group, rows, record, context)
 
 
 def main():

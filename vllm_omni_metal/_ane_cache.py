@@ -175,6 +175,58 @@ def eligible(packed, down):
     )
 
 
+def tiled_weight_shape(gate, up, down):
+    """Validate separate, bias-free projections without allocating a packed copy."""
+    if gate.ndim != 2 or up.shape != gate.shape or down.ndim != 2:
+        raise ValueError("matching gate/up and down matrices are required")
+    inner, hidden = gate.shape
+    if min(hidden, inner) <= 0 or down.shape != (hidden, inner):
+        raise ValueError("incompatible SwiGLU projection shapes")
+    if any(
+        value.dtype != gate.dtype
+        or value.device != gate.device
+        or not value.is_floating_point()
+        or not value.is_contiguous()
+        for value in (gate, up, down)
+    ):
+        raise ValueError("matching contiguous floating SwiGLU weights are required")
+    return hidden, inner
+
+
+def inner_tiles(hidden, inner):
+    """Largest eligible TILE-aligned slices; never raise the per-graph budget."""
+    if (
+        type(hidden) is not int
+        or type(inner) is not int
+        or min(hidden, inner) <= 0
+        or hidden % TILE
+        or inner % TILE
+    ):
+        raise ValueError("ANE requires positive tile-aligned projection dimensions")
+    width = MAX_WEIGHTS // (6 * hidden * TILE) * TILE
+    if not width:
+        raise ValueError("even one inner tile exceeds the ANE weight budget")
+    return tuple((start, min(start + width, inner)) for start in range(0, inner, width))
+
+
+def tiled_weights(weights, plans, *, host=False):
+    """Yield one bounded packed tile at a time, preserving [gate, up] ordering."""
+    for (gate, up, down), plan in zip(weights, plans, strict=True):
+        for start, end in plan:
+            parts = (gate[start:end], up[start:end], down[:, start:end])
+            if host:
+                # Separate MPS readback from all casts, including non-contiguous views.
+                g, u, d = (part.detach().to(device="cpu", copy=True) for part in parts)
+            else:
+                g, u, d = (part.detach() for part in parts)
+            yield torch.cat((g, u), dim=0), d.contiguous()
+
+
+def tiled_group_key(keys, shapes, plans, scope):
+    # Domain separation prevents a packed/partial-layer approval being reused.
+    return group_key(["inner-tiled-fp32-sum-v1", list(shapes), list(plans), list(keys)], scope)
+
+
 def weight_key(packed, down):
     hidden, inner = weight_shape(packed, down)
     digest = hashlib.sha256(repr((hidden, inner, str(packed.dtype), CHUNK)).encode())
@@ -296,3 +348,37 @@ def validate_profiles(data):
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError("Invalid ANE whole-pipeline calibration") from error
     return profiles
+
+
+def validate_tiled_profiles(data, shapes, plans):
+    """Require final-error and full activation-shape evidence for tiled approval."""
+    profiles = validate_profiles(data)
+    inputs = {}
+    for key, chunks in profiles.items():
+        if not chunks:
+            continue
+        record = data[profile_label(*key)]
+        checks = record.get("numerical_checks")
+        if not isinstance(checks, list) or len(checks) != len(shapes):
+            raise RuntimeError("Tiled ANE profile lacks final live-input numerical evidence")
+        for index, ((hidden, _), plan, check) in enumerate(zip(shapes, plans, checks, strict=True)):
+            if not isinstance(check, dict):
+                raise RuntimeError("Invalid tiled ANE numerical evidence")
+            shape = check.get("shape")
+            if (
+                not isinstance(shape, list)
+                or len(shape) not in (2, 3)
+                or any(type(size) is not int or size <= 0 for size in shape)
+                or shape[-1] != hidden
+                or math.prod(shape[:-1]) != key[0]
+                or check.get("tiles") != len(plan)
+                or any(
+                    type(check.get(name)) not in (int, float)
+                    or not math.isfinite(check[name])
+                    or not 0 <= check[name] <= 0.01
+                    for name in ("relative_l2", "scaled_max_abs")
+                )
+            ):
+                raise RuntimeError("Invalid tiled ANE shape or final numerical evidence")
+            inputs[key, index] = tuple(shape)
+    return profiles, inputs
