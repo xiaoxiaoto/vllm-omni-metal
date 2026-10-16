@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Generic OOT SiLU×gate using published MLX compiled SiLU and the official bridge."""
+"""Generic OOT SiLU×gate using optional Torch-stream kernels or the official MLX bridge."""
 
 from functools import lru_cache
 
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.activation import SiluAndMul
+
+from vllm_omni_metal import vpipe_kernels
 
 # shortcut: bridge overhead loses on small decode inputs; remeasure before lowering this gate.
 MIN_COMPILED_ELEMENTS = 262144
@@ -36,6 +38,9 @@ def _compiled_silu_and_mul():
 
 
 def _silu_and_mul_mps(x: torch.Tensor) -> torch.Tensor:
+    if vpipe_kernels.supports_silu(x):
+        return vpipe_kernels.silu_and_mul(x)
+
     import mlx.core as mx
     from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
 

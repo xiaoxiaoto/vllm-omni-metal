@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Optional upstream Torch-stream launcher; run this module once to build it locally."""
 
+import argparse
 import fcntl
 import hashlib
 import importlib.util
@@ -140,4 +141,5 @@ def build_mps_launcher() -> Path:
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__).parse_args()
     print(build_mps_launcher())

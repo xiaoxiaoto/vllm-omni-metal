@@ -14,6 +14,16 @@
 
 项目安装参考 vllm-metal：`install.sh` 创建独立 `.venv-vllm-omni-metal`（本地源码 editable）或 `~/.venv-vllm-omni-metal`（curl）；`Formula/vllm-omni-metal.rb` 创建 Homebrew libexec 并只链接 `vllm-omni`。查看 `docs/installation.md`；不把 Omni 装入已有 vllm-metal 共享环境。安装时固定 0.31 native CPU/MPS wheels 和 Omni main commit（开发版，不伪装稳定 release），Omni 构建变量是 `VLLM_OMNI_TARGET_DEVICE=cpu`。变更版本/commit/checksum 时同步 Formula、脚本及安装测试；未经完整安装验证，不宣称新入口端到端可用或已发布。
 
+### 已验证改动必须同步安装资源
+
+- 所有已验证的通用后端改动，必须在同次交付中同步到适用的安装资源，不能只保留在开发 checkout 或 editable 环境。逐项核对 `install.sh` 的源码/curl 路径、`Formula/vllm-omni-metal.rb`、`pyproject.toml` 的依赖/entry point/package-data、随包 native 源码及许可证、安装回归和 `docs/installation.md`；已经一致的资源无需无意义改写。
+- 涉及独立部署时，同步共享后端与模型私有 overlay 的准备器、源码/资源指纹、ready 校验和安装说明；模型专用补丁仍留在独立部署，不打入通用插件，不分发本机权重、缓存、校准 profile 或生成媒体。
+- 区分“已分发源码”“已验证显式构建”“已验证生产路径”。仅通过隔离 shader/数值测试的优化可以随包提供为可选资源，但不得自动启用、引入启动/请求期编译、放宽精度门槛，或宣称整模型加速。安装校验与工具构建必须使用所选 Python 的 `-I` 模式，避免 cwd/PYTHONPATH 串环境。
+- 安装资源变更后，执行适用的安装/部署回归、shell/Ruby 语法检查，并从干净副本构建 wheel，在临时环境验证非 editable 导入、完整随包资源和实际变更路径；mock、包可导入、历史通过记录不能替代本次安装烟测。交付列出本次命令、结果及未验证项。
+- 同步本地安装资源不等于发布或迁移服务。未经明确授权，不推送远端、不重装现有 Homebrew、不激活部署或重启服务；远端 curl/tap 未发布时必须明确说明。
+
+### 常用命令
+
 以下命令适用于配套依赖和构建工具已准备好的 `.venv-vllm-omni-metal`：
 
 ```bash

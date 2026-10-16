@@ -21,7 +21,7 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 原生 runner 已支持通用 `prepare_runner_inputs`（含 opt-in 请求级采样参数）、采样期间追加终结输出，以及按请求 ID 路由的稀疏音频输出。稀疏协议的非法 marker、重复/未知 ID 和列表长度不一致均拒绝传输；无输出的请求不会收到其他请求的音频或 hidden states。
 
-**YuE2 尚未完成端到端 Metal 支持。** 最新 Omni 有原生实现，但其模型采样仍有 CPU generator/MPS 张量不匹配和 CUDA pinned-memory/event 假设；这些修复属于上游模型，不在本插件硬编码。兼容性核对、实际测试及版本升级边界见 [YuE2 接入状态](docs/yue2-readiness.md)。安装入口已升级到 0.31 native wheels + 固定 Omni main 快照，Omni 明确标为开发版，不把它伪装成稳定 release。
+**随包未补丁 Omni 的 YuE2 仍未完成端到端 Metal 支持。** 其 CPU generator/MPS 张量不匹配和 CUDA pinned-memory/event 假设需要上游或独立模型适配，本插件不硬编码。独立 `yue2mps2` overlay 配合当前后端已完成真实512帧歌曲及 attention A/B，结果见[真实 YuE2 对照](docs/generic-backend.md#真实-yue2当前-torch-stream-attention-对照)；这不等于默认安装开箱可用。兼容性与升级边界见 [YuE2 接入状态](docs/yue2-readiness.md)。安装固定 Omni main 开发快照，不伪装稳定 release。
 
 ## 通用算子优化
 
@@ -39,7 +39,7 @@ Apple M4 Pro、BF16、batch=4、context=2048、Q/KV heads=16/4、head size=128�
 
 第二阶段已接入通用 **RMSNorm / 残差归一化**：移植上游已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的小型 IR adapter，调用 PyTorch 已有的融合 MPS RMSNorm，不写新 kernel、不升级依赖。原生 Metal worker 的 FP16/BF16、同 dtype/device 的一维 learned weight、完整 variance 默认选择 `omni_mps`；FP32、无 weight、variance override 或其他合法不匹配参数保留上游 `native`（MPS 输入仍在 MPS）。用户显式 IR 优先级保持优先，普通 LLM 配置不受影响。
 
-残差路径保留 **FP32 相加、未舍入 sum 的 variance、归一化先 cast 再乘 learned weight**；它仍包含独立加法等操作，**不是 add+RMSNorm 单 kernel 全融合**。随机 BF16 Llama/Qwen3 已检查 greedy 对照与 seed 隔离。
+残差路径保留 **FP32 相加、未舍入 sum 的 variance、归一化先 cast 再乘 learned weight**。现有 Torch 分解继续作为后备；显式预编译 vpipe 产物可启用连续无梯度 FP16/BF16 的 **add+RMSNorm 单 kernel**，缺产物、不支持布局或 epsilon 保持原路径。新 kernel 已通过显式测试编译的数值及随机模型生成对照，生产 AOT 构建/加载尚未验收。
 
 ```bash
 .venv-vllm-omni-metal/bin/python examples/benchmark_normalization.py --require-speedup
@@ -47,7 +47,7 @@ Apple M4 Pro、BF16、batch=4、context=2048、Q/KV heads=16/4、head size=128�
 
 Apple M4 Pro、BF16、4×4096、30 次同步计时：普通 RMSNorm 0.182 → 0.152 ms（1.19×），残差归一化 0.191 → 0.170 ms（1.12×）。这是一次指定形状的算子微基准，不代表整模型吞吐；复现会有负载波动。
 
-第三阶段接入通用 **SiLU×gate（SwiGLU）融合**：通过上游 CustomOp OOT 合同，复用已发布 MLX 的编译 SiLU 与官方 DLPack bridge，不写新 kernel、不替换模型方法。仅原生 worker 的 FP32/FP16/BF16、连续 1–3 维、无梯度、最后一维为偶数且输出元素数 ≥262144 时启用；小 decode、其他合法输入保留原设备上的上游实现。保留 SiLU 的 FP32 计算及乘 gate 前的 dtype 舍入；可用 `custom_ops=["none", "-silu_and_mul"]` 显式关闭。
+第三阶段接入通用 **SiLU×gate（SwiGLU）融合**：通过上游 CustomOp OOT 合同，缺少显式 vpipe AOT 产物时复用 MLX 编译 SiLU 与官方 DLPack bridge，有产物则可选择同一 Torch stream 的 packed kernel，不替换模型方法。仅原生 worker 的 FP32/FP16/BF16、连续 1–3 维、无梯度、最后一维为偶数且输出元素数 ≥262144 时启用；小 decode、其他合法输入保留原设备上的上游实现。保留 SiLU 的 FP32 计算及乘 gate 前的 dtype 舍入；可用 `custom_ops=["none", "-silu_and_mul"]` 显式关闭。这不是 GEMM+SwiGLU 投影级融合。
 
 ```bash
 .venv-vllm-omni-metal/bin/python examples/benchmark_activation.py --require-speedup
@@ -55,7 +55,7 @@ Apple M4 Pro、BF16、4×4096、30 次同步计时：普通 RMSNorm 0.182 → 0.
 
 M4 Pro、BF16、32×8192、30 次同步中位数：原生 0.343 → 编译路径 0.170 ms（约 **2.0×**），包含 OOT dispatch、桥接和同步。小块桥接收益不稳定，因此不默认优化小 decode。随机大 MLP Llama/Qwen3 已确认真实 worker 命中新路径、greedy 与 seed 回归通过；这仍不是整模型吞吐结果。可选缓存表 NeoX RoPE 的 vpipe 移植及限制见下节；隔离算子验证不等于默认 worker 已启用。
 
-GPU + ANE 合作提供独立、通用的 dense SwiGLU contract；默认 auto 只消费绑定源码/设备/权重/完整 pipeline 配置的离线校准，缺少匹配准备产物即保留 GPU，不在 worker/request 编译。FP16 math 必须由外部模型适配器显式选择，不是 BF16 等价替代；本插件不接管模型 registry 或捆绑 YuE2 实现。准备和误差限制见 [GPU + ANE 协议](docs/ane.md)。尚未做本次 real-model 安装/整流水线复验，不能宣称端到端默认加速。
+GPU + ANE 合作提供独立、通用的 dense SwiGLU contract；默认 auto 只消费绑定源码/设备/权重/完整 pipeline 配置的离线校准，缺少匹配准备产物即保留 GPU，不在 worker/request 编译。FP16 math 必须由外部模型适配器显式选择，不是 BF16 等价替代；本插件不接管模型 registry 或捆绑 YuE2 实现。本次真实 YuE2 图自检因 relative L2 5.50% 超过1%门槛被拒绝，没有可用的本次 ANE 加速结论。准备与误差限制见 [GPU + ANE 协议](docs/ane.md)。
 
 第四阶段提供可选 **纯 Torch-stream paged attention**：复用已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的 host launcher 和已安装的 0.31 shader。固定 wheel 缺少该 launcher，因此需在选定环境中显式编译一次（Apple Command Line Tools）；host adapter 仅补齐已发布 FP32 shader 的 dtype/路由选择，不升级依赖、不写 attention shader、不修改上游安装，运行时不自动编译。
 
@@ -64,19 +64,21 @@ GPU + ANE 合作提供独立、通用的 dense SwiGLU contract；默认 auto 只
 .venv-vllm-omni-metal/bin/python examples/benchmark_attention.py --require-speedup
 ```
 
-编译产物在用户私有 cache，绑定源文件、Torch 环境及 Python ABI；随后新 worker 的支持域 FP32/FP16/BF16 自动选择 Torch-stream。无匹配产物保留原 bridge；已存在但损坏/不安全的产物明确报错。attention 的元数据异步送入 Torch stream，KV 写读按同一 stream 排序，无 MLX 导入或每层显式 GPU wait；**不代表整个模型没有跨框架操作**，SwiGLU 大输入仍使用 bridge。
+编译产物在用户私有 cache，绑定源文件、Torch 环境及 Python ABI；随后新 worker 的支持域 FP32/FP16/BF16 自动选择 Torch-stream。无匹配产物保留原 bridge；已存在但损坏/不安全的产物明确报错。attention 的元数据异步送入 Torch stream，KV 写读按同一 stream 排序，无 MLX 导入或每层显式 GPU wait；**不代表整个模型没有跨框架操作**，缺少 vpipe AOT 时大输入 SwiGLU 仍使用 bridge。
 
 M4 Pro、BF16、batch=4、context=2048、16/4 heads、head size=128，20 次同步实测：gather+SDPA 5.936 ms、MLX bridge 0.515 ms、Torch-stream 0.477 ms；相对 bridge 约 **1.08×**，相对原 gather 约 12.45×。仅为指定形状微基准，新路径已验证独立数值对照、KV strides/offset、请求隔离与真实随机模型生成；真实大模型与 M5 NAX 尚未验收。
 
 ### vpipe 通用算子移植与当前未完成项
 
-固定参考 [tgo-app-dev/vpipe](https://github.com/tgo-app-dev/vpipe/tree/6a721d5c3b74ded70001f7c02121f14ae8f5321a)（Apache-2.0），移植通用 packed SwiGLU 与缓存表 NeoX RoPE，做必要的 dtype/layout 适配；不移植模型包装、频率重算、视频/量化或 Gemma 专用 residual 逻辑。来源和精度合同见 [执行协议](docs/generic-backend.md#vpipe-通用片段)及打包的 `_native/VPIPE.md`。
+固定参考 [tgo-app-dev/vpipe](https://github.com/tgo-app-dev/vpipe/tree/6a721d5c3b74ded70001f7c02121f14ae8f5321a)（Apache-2.0），移植通用 packed SwiGLU、缓存表 NeoX RoPE，并将 `rms_norm_fast_f16` 的 SIMD reduction 改编为等价 add-before-norm 双输出；做必要的 dtype/layout 适配，不移植模型包装、频率重算、视频/量化或 Gemma 专用 residual 逻辑。来源和精度合同见 [执行协议](docs/generic-backend.md#vpipe-通用片段)及打包的 `_native/VPIPE.md`。
 
 生产 worker **仅加载显式预编译 metallib**，缺失则保留原路径；运行 `python -m vllm_omni_metal.vpipe_kernels` 需要已安装的 Apple Metal compiler。本机 `xcrun --find metal` 失败，未安装工具。因此本次仅验证隔离 shader、OOT cache 合同及显式测试基准，不宣称新 RoPE 已在真实 worker 中加速。
 
 M4 Pro / BF16：缓存 RoPE（4 rows、hidden 4096、Q/KV heads32/8、head128）0.239 → 0.203 ms（1.18×）；单行 SwiGLU（width4096）0.138 → 0.138 ms（无收益），**不接入默认小 decode 路径**。FP32 attention batch4/context2048/head128 的三路为 6.377 / 0.617 / 0.597 ms，Torch-stream 比 bridge 快约1.03×。这些都不是模型吞吐。
 
-仍未完成：等价 residual-add+RMSNorm 单 kernel、小 decode 稳定加速、vpipe AOT/真实 worker 验收、真实 Higgs/YuE2 新路径与生产吞吐、M5 NAX。现有缓存缺少完整 Higgs/YuE2 权重，未自动下载；Homebrew/curl 当前未提交代码不能冒充已发布新入口。
+新增三路交错算子基准和 spawned native worker 四模式生成对照；随机 Llama/Qwen3 的新 SwiGLU/norm 整模型结果波动大，未证明稳定收益，见[逐项实测](docs/generic-backend.md#2026-10-15-逐项实测)。释放内存后，独立私有 overlay 已完成[真实 YuE2 attention 对照](docs/generic-backend.md#真实-yue2当前-torch-stream-attention-对照)，该结果不包含 ANE 或缺少产物的 vpipe AOT 融合。仍未完成：GEMM+SwiGLU、QK norm+RoPE+分页 KV 的通用跨算子接入，小 decode 稳定加速，生产 vpipe AOT、Higgs 新路径复验、生产负载和 M5 NAX。没有自动下载、停止现有服务或放宽水位；本地代码不能冒充已发布入口。
+
+本轮继续采用 [vllm-metal packed Q/K RoPE](https://github.com/vllm-project/vllm-metal/blob/f2e26b342c93d6c705ebee0950a0baf8025ee46d/vllm_metal/metal/kernels_v2/rope.metal)（Apache-2.0），完整 FP16/BF16 NeoX 的 Q/K 共用一次 dispatch，省去输入 clone，保留上游缓存边界和每次乘法舍入。M4 Pro BF16、32 rows、hidden4096 的实际 OOT 同步中位数 0.3334→0.1689 ms（1.97×）；这是显式测试编译，不是生产 AOT 或 YuE2 整模型加速。详细来源、对照口径及不采用方案见[成熟方案续移植](docs/generic-backend.md#成熟方案续移植packed-qk-rope)。
 
 ## 环境与安装
 
@@ -94,7 +96,7 @@ M4 Pro / BF16：缓存 RoPE（4 rows、hidden 4096、Q/KV heads32/8、head128）
 
 Omni 最新稳定 tag 仍为 0.30；需要 YuE2 等新集成时使用上述固定 main 快照，不能与 0.30 vLLM wheel 混装。native wheel 固定 SHA256，Omni 固定 commit，不在每次启动时自动追踪最新依赖，不下载模型。无需编译本项目或 vllm-metal 的原生 kernel。
 
-已在独立 `.venv-vllm-omni-metal` 完整安装并通过依赖检查、CLI 和 **72 项测试**（含真实 MPS 的随机 Llama/Qwen3、tiny SD 及原生 generation pipeline）；真实 Higgs 大权重验收未在新栈重跑，YuE2 音乐生成仍未通过。
+当前源码安装已在新的独立环境实际解析依赖并显式准备 Torch-stream launcher；源码与 wheel 隔离烟测、回归结果及未验证入口见[安装说明](docs/installation.md)。真实 YuE2 生成依赖独立模型 overlay，不等于未补丁 Omni 开箱支持；此前的随机模型集成结果不替代本次安装验证。
 
 ### 源码安装（当前 checkout 可用）
 
@@ -106,6 +108,8 @@ vllm-omni --help
 ```
 
 默认创建源码目录中的 `.venv-vllm-omni-metal` 并 editable 安装；可用 `./install.sh --venv /absolute/path/to/new-env` 指定独立环境。原有开发 `.venv` 保持不变。
+
+`./install.sh --with-mps-attention` 显式构建并验证 host launcher；`--with-vpipe` 需要已有 Metal compiler，`--with-ane` 只准备 CoreML host 工具，不表示 ANE 已通过模型校准。普通安装不编译。安装校验/构建使用所选环境 `-I`，忽略 cwd/PYTHONPATH；源码、curl 脚本与 Formula 分发同一组 native 资源，但未发布远端入口不会自动包含本地改动。
 
 ### Homebrew 与 curl
 

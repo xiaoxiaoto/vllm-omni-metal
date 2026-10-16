@@ -79,7 +79,7 @@ M4 Pro、BF16 batch4/context2048、Q/KV heads16/4、head128，20 次同步中位
 
 优化只选择 MPS FP16/BF16、非空输入、同 dtype/device 且宽度匹配的一维 learned weight、无 variance override。残差另外要求相同 shape/device/dtype。CPU、FP32、无 weight、部分 variance、混合权重或广播等原生合法参数仍交给上游 native；不把 MPS tensor 搬到 CPU，不忽略其他不支持配置。
 
-残差使用 FP32 sum 计算 variance，再按 vLLM 顺序先 cast normalized 值后乘 learned weight，并单独返回 cast 后的 residual sum；输入不就地改写。它使用融合 RMSNorm，但 add、cast、multiply 仍是独立操作，不宣称整个 residual+norm 是单 kernel 融合。
+残差使用 FP32 sum 计算 variance，再按 vLLM 顺序先 cast normalized 值后乘 learned weight，并单独返回 cast 后的 residual sum；输入不就地改写。有匹配的显式 vpipe AOT 产物时，连续、无梯度 FP16/BF16 输入选择改编自 `rms_norm_fast_f16` 的 add-before-norm 单 kernel；保留非连续、梯度、缺产物以及不适合 Metal FP32 常量的 epsilon（负数、非有限、溢出或非零 subnormal）的原 Torch 分解，不扩大原 IR provider 支持域。
 
 `tests/test_normalization.py` 检查 dispatch、用户优先级与作用域、spawn 导入、精度边界、非连续多维输入、maybe_inplace 语义和原生后备。`tests/test_native_runner.py` 新增 BF16 随机 Llama/Qwen3，检查真实配置已选择新 IR 优先级，保持 CPU HF greedy 和 seed 隔离对照。
 
@@ -93,13 +93,13 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \\
 
 ### SiLU×gate（SwiGLU）
 
-`activation.py` 使用已安装 MLX v0.32.1 的 [编译 `nn.silu`](https://github.com/ml-explore/mlx/blob/3a6219917e4535575ce5bce2fc2ba27a483a709b/python/mlx/nn/layers/activations.py)，commit `3a6219917e4535575ce5bce2fc2ba27a483a709b`，MIT。复用公开 `mx.compile(shapeless=True)` 将 SiLU、dtype 舍入和 up 分支乘法编译为一个 elementwise primitive；本地最小 Python adapter 处理 Torch 精度顺序、作用域及官方 DLPack bridge。这不是移植一个已合并的上游 Torch SwiGLU adapter，也不复制/自写 Metal shader；[已发布 stateless MLP 编译方案](https://github.com/vllm-project/vllm-metal/blob/e7a0c90bec180e5dd4275c473fd7a36e709a930e/vllm_metal/compiled_mlp.py) 的模型专用 wrappers 不采用。
+`activation.py` 通过上游 OOT 算子合同执行 SiLU×gate。有匹配 vpipe AOT 产物且满足既有大输入门槛时，选择同一 Torch stream 的 packed SwiGLU；否则使用已安装 MLX v0.32.1 的[编译 `nn.silu`](https://github.com/ml-explore/mlx/blob/3a6219917e4535575ce5bce2fc2ba27a483a709b/python/mlx/nn/layers/activations.py)（MIT）及官方 DLPack bridge。MLX 路径复用 `mx.compile(shapeless=True)`，不接管权重；[已发布 stateless MLP 编译方案](https://github.com/vllm-project/vllm-metal/blob/e7a0c90bec180e5dd4275c473fd7a36e709a930e/vllm_metal/compiled_mlp.py) 的模型专用 wrappers 不采用。这不是 GEMM epilogue 融合。
 
 通过 vLLM `SiluAndMul.register_oot` 注册通用算子子类，不修改原始类的方法、in-tree operator registry 或模型 registry。OOT 查找使用类名 `SiluAndMul`，配置启停名保留原始 `silu_and_mul`。每个 spawn worker 在加载模型前导入该 provider，导入阶段不初始化 MLX。原生配置以 `none` 禁用其他 CUDA ops，只选择安全的 `+silu_and_mul` 与可选 `+rotary_embedding`；各自显式 opt-out 保留，冲突指令明确报错。普通 worker 或无当前 engine 配置不选择桥接。
 
 仅 MPS FP32/FP16/BF16、连续 1–3 维、无梯度、最后一维偶数且输出元素数 ≥262144 的推理输入启用。这是测得的跨框架开销门槛，不是模型白名单；小 decode、非连续、空输入、梯度和其他输入继续走上游实现，保留原设备、异常与 autograd 语义。MLX SiLU 使用 FP32 计算，先舍入到输入 dtype，再乘 up 分支，不能只在最终结果 cast。借用的输入保持至 `mx.eval` 完成以防 buffer donation，输出通过官方 bridge 回到 Torch；不接管权重、模型加载或 RNG。
 
-`tests/test_activation.py` 覆盖无 MLX 的 fresh-worker 注册、原类/模型映射不变、作用域、预算、FP32/FP16/BF16 的 1D/2D/3D 数值、输入不变、输出生命周期、梯度及关闭后备。FP16/BF16 判别样例分别包含 81/72 个不能省略中间舍入的位置，逐值精确对照；MLX 导出的图确认同一个 compiled primitive 包含 sigmoid、两次乘法和两次 cast。`tests/test_native_runner.py` 增加 BF16 大 MLP 随机 Llama/Qwen3，与 CPU HF greedy 和 seeded batch/solo 对照；使用测试专属 worker extension 和字符串 RPC 在真实子进程检查路径，不关闭 spawn、不放开不安全序列化。
+`tests/test_activation.py` 覆盖无 MLX 的 fresh-worker 注册、原类/模型映射不变、作用域、预算、FP32/FP16/BF16 的 1D/2D/3D 数值、输入不变、输出生命周期、梯度及关闭后备；显式测试编译另外验证无 MLX 的 Torch producer→activation→consumer 数值。FP16/BF16 判别样例逐值检查不能省略的中间舍入。`tests/test_native_runner.py` 使用 BF16 大 MLP 随机 Llama/Qwen3 对照 CPU HF greedy 及 seeded batch/solo；真实子进程通过字符串 RPC 检查路径，不关闭 spawn、不放开不安全序列化。
 
 ```bash
 VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \
@@ -111,7 +111,7 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \
 
 ### vpipe 通用片段
 
-固定参考 `tgo-app-dev/vpipe` commit `6a721d5c3b74ded70001f7c02121f14ae8f5321a`，Apache-2.0，源码/适配说明打包为 `_native/VPIPE.md`。只采用 elementwise SwiGLU 和 table-driven partial NeoX RoPE；没有移植模型/codec/视频/quantization，也没有采用会重算频率或使用专用 ring KV 布局的融合。上游有 unit tests，未发现 pinned revision 的公开 GitHub Actions，不宣称全套上游 CI 通过。
+固定参考 `tgo-app-dev/vpipe` commit `6a721d5c3b74ded70001f7c02121f14ae8f5321a`，Apache-2.0，源码/适配说明打包为 `_native/VPIPE.md`。采用 elementwise SwiGLU、table-driven partial NeoX RoPE，以及 `rms_norm_fast_f16` 的 per-row SIMD reduction（改编为符合 vLLM 合同的 add-before-norm 双输出）。没有移植模型/codec/视频/quantization，也没有采用会重算频率或使用专用 ring KV 布局的融合。上游有 unit tests，未发现 pinned revision 的公开 GitHub Actions，不宣称全套上游 CI 通过。
 
 原版 SwiGLU 只做最终 cast，与 Torch 的中间舍入不等价（FP16/BF16 的257元素判别样例有81/72处差异）；移植先 cast SiLU，再乘 up，并读取连续 packed `[gate,up]`。缓存 NeoX RoPE 同样保留每个乘法的 dtype 舍入，再加减；上游 `cos_sin_cache` 构建、缩放、dtype 匹配和 `index_select` 输入边界校验不变，不重算频率。只注册通用 `RotaryEmbedding` OOT 子类；其他派生 RoPE、GPTJ style、梯度/非连续/其他合法输入保留原生实现，模型映射与原类方法不变。返回新 storage，partial tail 和 query/key 输入保持不变。
 
@@ -126,7 +126,90 @@ python examples/benchmark_vpipe.py --compile-for-test --operator silu --rows 1
 
 测试覆盖三种 dtype、packed rows、257元素精度判别、cache 随机覆盖（不能替换成自算频率）、partial tail、key=None、GPTJ fallback、输入不变、artifact/预算安全。M4 Pro BF16 RoPE 4×hidden4096（head128、Q/KV heads32/8）0.239/0.203ms（1.18×）；单行 width4096 SwiGLU 0.138/0.138ms，无收益，数值片段**不接入默认小 decode**。FP32 attention 4×context2048、Q/KV16/4、head128：gather/bridge/Torch-stream 6.377/0.617/0.597ms（bridge改进1.03×）。基准含最终同步，预算64MiB（vpipe）/256MiB（attention）、headroom3GiB；不能外推模型吞吐。
 
-未完成 residual-add+RMSNorm 单 kernel：vpipe `rms_add` 是 norm 后加 residual，语义不符；其他检索候选缺可辨许可证、等价 dtype 合同或 norm 验证，不能靠自写新 kernel/放宽精度来冒充移植。Higgs 缓存 index 指向的完整权重缺失，YuE2 缓存无权重；未下载，不宣称真实模型新路径通过。M5 NAX 需真机，当前是 M4 Pro。
+add-before-norm 单 kernel 已完成数值及显式测试 worker 验证，但不是原样采用语义不同的 vpipe `rms_add`。GEMM+SwiGLU 仍缺合法的跨算子接入：linear OOT 不知道下一步 activation，SiluAndMul OOT 拿不到原输入与投影权重；vpipe 原实现另有交错布局和省略中间舍入的问题。QK norm+RoPE+KV 的上游 backend 合同存在，但 MPS 图融合 pass 未开放，当前 eager attention 入口拿不到 positions/cache/norm weights；不能以未命中的方法宣称完成。ModelScope 本地有 Higgs/YuE2 权重候选，HF 对应缺失不能概括全部缓存；本轮未做全量权重完整性校验，也未完成这些模型的新路径验收。
+
+### 成熟方案续移植：packed Q/K RoPE
+
+采用 [vllm-metal `f2e26b3` 的融合 RoPE](https://github.com/vllm-project/vllm-metal/blob/f2e26b342c93d6c705ebee0950a0baf8025ee46d/vllm_metal/metal/kernels_v2/rope.metal)（Apache-2.0）：Q/K 共用一次 dispatch，每线程旋转一对元素，直接写新输出，省去原先两次 clone、两次旋转及 cos/sin FP32 转换。仍先通过 Torch `index_select` 校验并收集上游缓存，不在 shader 中直接使用未校验 positions。每个乘法先舍入到输入 dtype，再加减；FP16/BF16、GQA、修改后的缓存及输入不变已逐位验证。仅完整 NeoX、同时有 Q/K 时采用；partial、FP32、key=None 仍走既有实现。没有扩大支持范围，没有融合 projection/QK norm/KV 写入。
+
+本轮有界检索排除了图形/游戏/语言运行时；只细读 vllm-metal 与 [MLX RMSNorm](https://github.com/ml-explore/mlx/blob/36969c094354086e15d2a327a9c50feb20b9cf11/mlx/backend/metal/kernels/rms_norm.metal)（MIT）。两项目均有活跃维护和 CI。MLX 的 FP32 SIMD 归约与当前 Torch/vpipe norm 重复，未再引入桥接或第二套运行时；MRv2 输入兼容替换、模型专用融合、量化和 M5 NAX 不属于本次合法加速落点。不是穷尽所有 Metal 项目的结论。
+
+M4 Pro，Q/KV heads32/8、head128、hidden4096；现有 `examples/benchmark_vpipe.py` 的 **30 次逐调用同步中位数**，包含 OOT dispatch、缓存选择和同步：
+
+| dtype / rows | 上游 native（ms） | packed Q/K OOT（ms） | 耗时比 |
+| --- | ---: | ---: | ---: |
+| BF16 / 32 | 0.3334 | 0.1689 | 1.97× |
+| FP16 / 1 | 0.2191 | 0.1449 | 1.51× |
+
+```bash
+python examples/benchmark_vpipe.py --compile-for-test --operator rope --rows 32 --dtype bfloat16 --require-speedup
+python examples/benchmark_vpipe.py --compile-for-test --operator rope --rows 1 --dtype float16 --require-speedup
+```
+
+另存 `outputs/metal-packed-rope-current/report.json`：对上一版 separate-Q/K shader 做交错 7 轮、每轮100次异步调用后同步的隔离 A/B；6个 dtype/rows 组合均逐位等于 Torch，测得1.81–3.29×，有负载波动。计时口径不同，不能与上表混算。
+
+**以上均为显式测试编译，不是生产 AOT 或 YuE2 新增整模型收益。** 生产仍只加载显式 metallib；本机缺 Metal compiler，默认 worker 不会命中新融合。新增源码随 wheel、源码安装及 Formula 一并分发，不自动装工具，不在启动/请求 JIT。
+
+### 2026-10-15 逐项实测
+
+本次为 M4 Pro 16 GPU cores、48 GiB、Torch 2.13。Metal compiler 缺失，生产 AOT 构建/加载未验收；以下新 shader 均通过显式 `--compile-for-test` 编译，不能冒充默认生产 worker 已启用。生产不增加 JIT fallback。
+
+算子基准各 10 次 warmup、50 次交错正反序测量，计入 dispatch 与最终同步。与原后端比较，而不是只与更慢的原生分解比较：
+
+| BF16 算子与形状 | 原后端中位 ms | 候选中位 ms | 原后端 / 候选 |
+| --- | ---: | ---: | ---: |
+| residual-add+RMSNorm，4×4096 | 0.3341 | 0.2043 | 1.635× |
+| SwiGLU，32×8192 输出 | 0.1355（MLX bridge） | 0.1388（Torch stream） | 0.976× |
+
+`examples/benchmark_native_optimizations.py` 通过真正 spawned native worker、scheduler、分页 attention、采样和 CPU token 返回执行完整生成；同一模型/worker 切换 baseline、仅 activation、仅 normalization、两者组合。禁用可选 RoPE OOT，避免第三项优化混入对照。四层、hidden512、intermediate8192、head64、约5309万**本地随机参数**，不是预训练权重或真实 TTS 验收。每次 batch2、每请求64 prompt tokens+16 output tokens；2轮warmup、8次交错计时：
+
+| 模型 | 当前后端 ms | 仅 Torch-stream SwiGLU ms | 仅 add+RMSNorm ms | 两者组合 ms |
+| --- | ---: | ---: | ---: | ---: |
+| 随机 Llama | 417.427 | 411.675 | 374.262 | 383.231 |
+| 随机 Qwen3 | 269.673 | 375.234 | 403.330 | 286.521 |
+
+所有模式实际命中计数已核对：每次生成候选 activation 8次、候选 norm136次；greedy与seed42输出跨模式一致。系统干扰很大，Llama baseline样本297–543ms、Qwen3 baseline71–472ms，候选区间也重叠；**不能据此认定模型级稳定加速，更不能只挑 Llama 的有利结果外推**。SwiGLU 不降低小 decode 门槛；新路径保持显式 AOT 准备边界。
+
+首轮真实预训练 Qwen3-VL-2B 两次均在加载前被预算拒绝：available分别9.62/7.20GiB，按本地权重字节和系统余量计算需要10.93GiB；没有生成数据。当时独立 YuE2 完整 ANE 校准入口也被启动前16GiB available门槛拒绝；释放内存后的真实 YuE2 结果见下节。现有 host extension 实测 `nax_supported=False`，M5 NAX不可验证；不停止用户服务、不调高水位。
+
+```bash
+# 小张量；显式测试编译，不创建生产 worker JIT 路径。
+.venv-vllm-omni-metal/bin/python examples/benchmark_normalization.py --compile-for-test --iterations 50
+.venv-vllm-omni-metal/bin/python examples/benchmark_activation.py --compile-for-test --iterations 50
+# 实际模型执行层，随机权重，不下载。
+.venv-vllm-omni-metal/bin/python examples/benchmark_native_optimizations.py --compile-for-test --architecture llama --iterations 8
+.venv-vllm-omni-metal/bin/python examples/benchmark_native_optimizations.py --compile-for-test --architecture qwen3 --iterations 8
+# 已有本地预训练权重可用 --model /absolute/checkpoint；加载前按文件大小检查预算。
+```
+
+上述随机模型检查：全部非集成223项通过；normalization、vpipe kernels、activation、native runner 的显式 MPS 回归190项通过（含独立 HF greedy 与 seed/request isolation）；另实际运行16-token短prompt/2-token输出烟测，确认短请求不一定合批、不能按总token数假定激活命中。Ruff check、format check及pip check通过。预训练模型、真实媒体与生产AOT不计入这批测试。
+
+### 真实 YuE2：当前 Torch-stream attention 对照
+
+释放内存后，使用本地真实 YuE2-3B / YuE2-Vae 权重和独立 `0.31.0.dev0+cpu.yue2mps2` overlay，加载当前 checkout 的通用后端，通过上游 `AsyncOmni` / `Yue2Adapter` 完成 AR→NAR→VAE 生成。该 overlay 包含独立模型适配修复，**不是随包未补丁 Omni 已自动支持 YuE2**，也未修改上游安装、registry 或现有服务。
+
+M4 Pro、BF16 AR/NAR、FP32 VAE；同一 worker、seed42、512帧预算、相同歌词/风格/原生采样。每路独立 warmup，再按 bridge→Torch→Torch→bridge 计时，包含采样、合成及最终 CPU 音频返回，不含模型加载和 warmup。两路仅切换通用 attention 的执行 stream；其他当前后端设置相同。资源配置仅缩小至 context6144、显式 KV1GiB，保留同步 uni、CUSTOM、关闭 prefix cache、原生拓扑及输入语义。
+
+| Attention 路径 | 样本1 s | 样本2 s | 中位 s |
+| --- | ---: | ---: | ---: |
+| 原 MLX bridge | 54.953 | 61.322 | 58.138 |
+| 当前 Torch stream | 41.130 | 41.079 | 41.105 |
+
+本次中位耗时比为 **1.414×**，延迟降低 **29.30%**；每路仅两次正式样本，不推广到其他模型、输入或长期热负载。每次真实请求实际命中14364次 paged attention：Torch 路径全部命中 host launcher，bridge 路径0次 Torch forward。
+
+生成 **20.4787秒、48kHz、双声道 PCM16 WAV**；有限、非静音、幅度检查通过。各路同seed重复 hash 一致，跨路浮点音频也完全一致；不等于听感或歌词准确率验收。所有请求 pending 清零，engine正常退出，本次进程已结束；最低系统可用内存10.48GiB，无资源停止线触发。
+
+**本次没有启用 ANE 或 vpipe AOT shader。** 新 RoPE/SwiGLU/add+RMSNorm metallib 仍缺编译工具，不能将本表归因于这些融合。真实 ANE 图自检 relative L2=5.499455%、峰值归一误差0.794141%，L2超过1%门槛，正确拒绝且不发布 profile。独立校准脚本已修复失败RPC被当成功、准备失败关闭原组及TorchVersion不能安全序列化的问题；11项行为回归通过，真实失败复验在 prepare 阶段立即退出，没有继续生成或启用不安全 pickle。
+
+独立部署目录复现入口（`PYTHONPATH` 指向此 checkout；只使用本地权重，不调用服务启停脚本）：
+
+```bash
+VLLM_PLUGINS=metal,vllm_omni_register_models <yue2-private-overlay-python> prepare_ane.py \
+  --gpu-only --attention-ab --frames 512 --deploy-config /path/to/resource-profile.yaml
+```
+
+本机原始记录、配置、artifact哈希、全部WAV及拒绝证据保存在 `outputs/yue2-real-current-20261015-204628/`；该目录被Git忽略，不是发行包资产。
+
 
 ### 请求与模型 hook
 

@@ -56,4 +56,10 @@ group.close()
 
 这些是**此前原型**结果，不是本次安装、正式 API 或任意模型的性能验收。独立 YuE2 部署的 `prepare_ane.py` 用原生流程重新准备/校准并核对默认 reader 与同 seed 输出；本后端不捆绑该模型适配。现有 200 帧样本 NAR 只有 202 行，不协同；未知输入形状/context 仍使用 GPU。未做听感、所有 ODE 步审计、跨模型完整生成、长热负载或真实 ANE trace，不宣称这些能力通过。
 
+2026-10-15 首轮复验被启动前16GiB available门槛拒绝。释放内存后已实际加载真实 YuE2-3B/VAE 并进入图准备：完整FFN自检 relative L2 **5.499455%**、峰值归一误差 **0.794141%**，L2超过1%而拒绝，未发布profile。静态核对未发现足以确证修复的布局/桥接错误；不能仅凭此认定全部误差必然来自FP16，也不能放宽门槛或用历史原型收益代替。
+
+独立校准工具已修复上游RPC失败字典被当成成功、准备失败提前关闭原FFN组、TorchVersion元数据不能安全序列化的问题。11项行为回归及真实失败复验通过：prepare拒绝后立即退出，保留原健康组并正常关闭engine，不继续采样、不启用不安全pickle。
+
+随后显式 `--gpu-only --attention-ab` 完成真实 AR→NAR→VAE 生成，比较的是旧 MLX bridge 与当前 Torch-stream attention；详见[真实 YuE2 对照](generic-backend.md#真实-yue2当前-torch-stream-attention-对照)。该结果不包含ANE，也不代表随包未补丁Omni已支持YuE2。未停止其他服务、放宽资源线或复用旧身份图。
+
 源码来自固定 vpipe Apache-2.0 版本，见 [`_native/VPIPE.md`](../vllm_omni_metal/_native/VPIPE.md)。emitter 直接生成 vpipe 格式的 compiled bundle，不是 Apple 公共转换器；系统更新可能不兼容，须重建并重新通过计划与数值检查。

@@ -29,11 +29,20 @@ python -m pip check
 ./install.sh --venv "$HOME/.venv-vllm-omni-metal"
 ```
 
+安装时可显式准备所选工具，选项可以组合：
+
+```bash
+./install.sh --venv /absolute/path/to/new-env --with-mps-attention
+# 可选：--with-vpipe（已有 Metal compiler）、--with-ane（已有 clang++/Swift）
+```
+
+默认不构建。构建失败即退出，不打印安装成功；不安装工具、不下载权重、不转换模型或校准。安装验证及构建以所选 Python 的 `-I` 隔离模式执行，忽略调用方 cwd/PYTHONPATH；模块 `--help` 和非法参数只解析参数，不触发构建。
+
 安装器只接受新目录或它自己标记创建的环境，不接管任意已有 venv/Homebrew libexec，不使用 `--clear`。失败时保留环境和缓存供诊断、重试。依赖和插件在同一次 uv 解析中安装，保持 vllm-metal 声明的 mlx-lm Git URL 可见。
 
 总部署预检可以设置 `VLLM_OMNI_COMMIT=<完整 40 位 SHA>`，让安装器从查询到的官方 Omni 主干 commit 构建；省略时仍使用上述固定快照。非法 commit 会在安装前拒绝。开发版公开版本与 CPU 构建标记保持明确，不伪装稳定发布。
 
-`docker-compose/start.sh` 的模型启动现在统一调用 `prepare_backend.py`：查询官方最新核心标签与 Omni main，构建独立 Application Support 后端，并从本仓库构建非 editable wheel。四个模型使用同一版本组，YuE2/MOSS 私有扩展只覆盖各自模型适配；不修改 Homebrew。新官方核心超出当前兼容矩阵时明确拒绝启动，须先更新 native wheel pins、插件依赖和部署校验并重新验证，不能逐包盲升。
+`docker-compose/start.sh` 的模型启动统一调用 `prepare_backend.py`：查询官方最新核心标签与 Omni main，构建独立后端，并从本仓库干净副本构建非 editable wheel。准备器显式选择 `--with-mps-attention`，在选定环境的全新 `-I` 进程中验证 launcher 能加载；源码/native资源、安装脚本及准备器内容均进入指纹，校验通过且构建期间指纹未变才写 `.ready` 并激活。YuE2 私有 overlay 在自己的解释器重复准备与加载验证，不能借基础环境的缓存冒充可用；已有 ready 也会重新验证，失败先撤销 ready。部署模型使用同一版本组，模型私有扩展不进入通用插件、不修改 Homebrew。新官方核心超出兼容矩阵时明确拒绝，不能逐包盲升。
 
 更新一个已使用的环境前，先停止所有使用它的服务。本次安装使用新的独立环境，保留运行中的 Higgs 及旧 Homebrew 环境；没有自动迁移服务。
 
@@ -57,6 +66,8 @@ brew test xiaoxiaoto/vllm-omni-metal/vllm-omni-metal
 ```
 
 配方使用独立 `libexec`，仅链接 `vllm-omni`，不接管已有 `vllm`。保留 `preserve_rpath` 和 TVM-FFI/xgrammar RECORD。Python 位于 `$(brew --prefix vllm-omni-metal)/libexec/bin/python`，无需激活。
+
+Formula 的校验、可选工具准备及 CLI help 均通过该 libexec Python 的 `-I` 模式执行，并断言插件来自此环境内的非 editable 安装，避免调用方 cwd/PYTHONPATH 命中开发源码或其他安装。
 
 不要只比较插件 HEAD 是否变化来判断依赖已升级。总部署已改用统一隔离后端，不再依赖上述 Homebrew Formula；单独使用 Formula 的项目仍需按发布、停止、重装的顺序迁移，不能复用旧 0.30 栈。
 
@@ -90,7 +101,7 @@ source ~/.venv-vllm-omni-metal/bin/activate
 .venv-vllm-omni-metal/bin/python -m vllm_omni_metal.ane_build --bridge
 ```
 
-需要现有 Apple Command Line Tools（clang++/Swift）及 macOS 15+；没有时明确失败，不下载工具。Homebrew 命令见 Formula caveats。该步骤只构建 host 工具，不下载/转换模型，也不代表 ANE 可用；模型适配器还须显式准备权重图并以完整 pipeline 延迟批准 profile。默认 auto 无匹配 profile 时保留 GPU，FP16 近似精度、生命周期及已知 5.18% 音频差异见 [GPU + ANE 协议](ane.md)。没有在当前已安装/运行的环境中重启或发布验证。
+需要现有 Apple Command Line Tools（clang++/Swift）及 macOS 15+；没有时明确失败，不下载工具。Homebrew 命令见 Formula caveats。该步骤只构建 host 工具，不下载/转换模型，也不代表 ANE 可用；模型适配器还须显式准备权重图并以完整 pipeline 延迟批准 profile。默认 auto 无匹配 profile 时保留 GPU；当前真实 YuE2 图 relative L2 5.499% 超过1%门槛被拒绝，不得放宽门槛。FP16近似精度与生命周期见 [GPU + ANE 协议](ane.md)。没有重启当前服务或发布远端入口。
 
 ## 可选：vpipe 源算子 metallib
 
@@ -98,7 +109,7 @@ source ~/.venv-vllm-omni-metal/bin/activate
 python -m vllm_omni_metal.vpipe_kernels
 ```
 
-需要**已安装的 Apple Metal compiler**（`xcrun --find metal`）；它与仅能编译 host Objective-C++ 的 Command Line Tools 不等同。构建在本地私有 cache、离线、显式执行，不安装工具、不修改上游依赖。生产 worker 缺少匹配 metallib 时保留原路径，绝不在 startup/request 自动编译。本机缺 compiler，所以本次仅验证了隔离源 shader/数值/benchmark，未宣称 AOT 或真实 worker 已可用；单行小 SwiGLU 无稳定收益，仍不接入默认路径。来源和限制见[执行协议](generic-backend.md#vpipe-通用片段)。
+需要**已安装的 Apple Metal compiler**（`xcrun --find metal`）；它与仅能编译 host Objective-C++ 的 Command Line Tools 不等同。也可安装时显式选择 `--with-vpipe`。构建在本地私有 cache、离线执行，不安装工具、不修改上游依赖。生产 worker 缺少匹配 metallib 时保留原路径，绝不在 startup/request 自动编译。本机缺 compiler，因此 packed Q/K RoPE 等新增源码仅完成隔离 shader/OOT 数值与计时，不宣称 AOT 或真实 worker 已可用；单行小 SwiGLU 无稳定收益，仍不接入默认路径。来源和限制见[执行协议](generic-backend.md#成熟方案续移植packed-qk-rope)。
 
 ## 使用与验证
 
@@ -112,8 +123,12 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q
 
 原生 profile 要求 CUSTOM、单设备、同步调度、关闭 prefix cache，见 [通用后端协议](generic-backend.md)。安装器不启动模型，不替换 registry、模型 topology 或请求语义。
 
-本轮从新的私有安装器环境完成真实联网解析/安装（223 packages）、`pip check`、版本与 MPS generator 校验、CLI `--help`、显式 attention host 编译和 **277 passed / 1 skipped**。开发环境另通过166个非集成测试及同一277/1完整回归。测试包括随机 Llama/Qwen3、tiny SD、原生 generation、FP32 paged attention 和隔离 vpipe shader；跳过的是需显式提供大权重的 Higgs 验收。vpipe AOT 仍因 Metal compiler 不可用阻塞，不能把隔离 shader 测试算成真实 worker 新路径成功。mock 安装回归另覆盖源码/curl 命令、安全边界、固定版本与 checksum 同步。
+**既有完整后端验收（历史记录，非本次重跑）：**
 
-YuE2 的模型级 MPS 障碍尚未修复；更新依赖不等于音乐生成可用，见 [接入状态](yue2-readiness.md)。PyAV/OpenCV/系统 FFmpeg 存在重复 Objective-C 类警告，本次 CLI 与测试可通过，但媒体视频路径未额外验收。
+本轮在全新私有安装器环境实际解析/安装223个包，验证固定版本、MPS generator、随包10项 native资源，并显式准备 attention host launcher；额外以污染的 cwd/PYTHONPATH 重跑，隔离验证仍通过。随后实际调用部署准备器的干净副本 wheel 安装路径：非 editable 导入、`pip check`、三个可选模块及服务CLI help通过；禁用MLX、请求期编译和显式同步后，FP32/FP16/BF16六个序列、每序列四步 attention 正确执行，记录在 `outputs/metal-install-current/report.json`。最终非集成回归 **259 passed / 143 deselected**，旋转/vpipe针对性回归（含实际MPS）**90 passed**，Ruff、格式、shell和Ruby语法通过。安装mock/CPU准备器回归不冒充真实安装；此前277/1是历史集成结果，不作为本轮完整重跑结论。未实际运行会停服务的总部署激活流程，未发布远端curl或重装Homebrew。
+
+**本次安装资源同步验收：** 从干净副本重新构建 wheel，并在临时非 editable 环境安装；依赖通过显式 `.pth` 复用所选开发环境，没有重新解析完整依赖。安装后的全部30个包文件（含10项 native资源）与当前源码逐字节一致。使用仅替代 Homebrew 声明 DSL 的临时执行器，实际运行 Formula 的测试块：cwd/PYTHONPATH 污染场景修复前失败，改用所选 Python `-I` 后通过，覆盖版本、MPS generator、资源及四个 CLI help；这不是实际 `brew install/test`。安装/部署回归54项通过，Ruff、格式与shell/Ruby语法通过。持续同步指令已写入 `AGENTS.md`，临时环境与执行器已清理；未发布、切换服务或重跑模型生成。
+
+未补丁 Omni 的 YuE2 模型级 MPS 障碍仍需独立适配；私有 `yue2mps2` overlay 已有真实512帧歌曲与 attention 对照，但不代表普通安装开箱可用，见 [接入状态](yue2-readiness.md)。PyAV/OpenCV/系统 FFmpeg 存在重复 Objective-C 类警告，本轮安装/CLI未因此失败，媒体视频路径未额外验收。
 
 卸载仅移除确认不再被服务使用的安装器环境或 `brew uninstall vllm-omni-metal`；不删除模型缓存、生成文件或仍被其他项目使用的 vllm-metal。

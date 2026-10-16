@@ -166,21 +166,27 @@ def test_mps_compiled_activation_parity_without_mutation_or_donation(dtype, shap
 
 @pytest.mark.integration
 @MPS
-def test_compiled_graph_fuses_silu_and_gate_into_one_primitive(tmp_path):
-    import mlx.core as mx
-    from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_torch_stream_activation_producer_consumer_without_mlx(monkeypatch, dtype):
+    from vllm_omni_metal import vpipe_kernels
 
-    x = torch.randn(32, 16384, dtype=torch.bfloat16, device="mps")
-    shared = torch_to_mlx(x)
-    result = activation._compiled_silu_and_mul()(shared[:, :8192], shared[:, 8192:])
-    path = tmp_path / "compiled.dot"
-    mx.export_to_dot(str(path), result)
-    primitives = [line for line in path.read_text().splitlines() if "label =" in line]
-    compiled = [line for line in primitives if 'label ="Compiled' in line]
-    assert len(compiled) == 1 and "Sigmoid" in compiled[0]
-    assert compiled[0].count("Multiply") == 2 and compiled[0].count("AsType") == 2
-    assert all("Slice" in line or line in compiled for line in primitives)
-    mx.eval(result)
+    config = native_config()
+
+    library = torch.mps.compile_shader(
+        f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n" + vpipe_kernels._SOURCE.read_text()
+    )
+    monkeypatch.setattr(vpipe_kernels, "_library", lambda _: library)
+    monkeypatch.setitem(sys.modules, "mlx", None)
+    torch.manual_seed(29)
+    x = torch.randn(32, 16384, dtype=dtype, device="mps")
+    before = x.cpu()
+    expected = (SiluAndMul.forward_native(x * 0.5) + 1).cpu()
+    with set_current_vllm_config(config):
+        layer = SiluAndMul(compile_native=False)
+        actual = layer(x * 0.5) + 1
+    tolerance = 2e-6 if dtype == torch.float32 else 0
+    torch.testing.assert_close(actual.cpu(), expected, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(x.cpu(), before, atol=0, rtol=0)
 
 
 @pytest.mark.integration

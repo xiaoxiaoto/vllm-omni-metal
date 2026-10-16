@@ -201,3 +201,112 @@ def test_unsupported_mps_norm_arguments_use_native_without_cpu_transfer(case):
     torch.testing.assert_close(
         actual, op.impls["native"].impl_fn(x, weight, 1e-6, variance), atol=0, rtol=0
     )
+
+
+@pytest.fixture
+def explicit_norm_shader(monkeypatch):
+    from vllm_omni_metal import vpipe_kernels
+
+    libraries = {}
+
+    def library(dtype):
+        if dtype not in libraries:
+            # Isolated test opt-in only; production remains load_metallib-only.
+            libraries[dtype] = torch.mps.compile_shader(
+                f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n"
+                + vpipe_kernels._SOURCE.read_text()
+            )
+        return libraries[dtype]
+
+    monkeypatch.setattr(vpipe_kernels, "_library", library)
+    return vpipe_kernels
+
+
+@pytest.mark.integration
+@MPS
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [128, 4096])
+def test_ir_add_rms_norm_uses_single_kernel_with_upstream_rounding(
+    explicit_norm_shader, monkeypatch, dtype, hidden_size
+):
+    kernels = explicit_norm_shader
+    torch.manual_seed(17)
+    op = ir.ops.fused_add_rms_norm
+    args = op.generate_inputs(num_tokens=4, hidden_size=hidden_size, dtype=dtype, device="cpu")
+    args[0][0].fill_(1)
+    args[1][0] = (
+        torch.tensor([0.125, 0.375, 0.625, 0.875], dtype=dtype).repeat(hidden_size // 4)
+        * torch.finfo(dtype).eps
+    )
+    args[2].copy_(torch.tensor([1.25, 1.75, 0.75, 1.5], dtype=dtype).repeat(hidden_size // 4))
+    expected = op.impls["native"].impl_fn(*args)
+    gpu_args = tuple(item.to("mps") if isinstance(item, torch.Tensor) else item for item in args)
+    saved = [item.clone() for item in gpu_args if isinstance(item, torch.Tensor)]
+    calls = []
+    add_rms_norm = kernels.add_rms_norm
+
+    def fused(*inputs):
+        calls.append(True)
+        return add_rms_norm(*inputs)
+
+    monkeypatch.setattr(kernels, "add_rms_norm", fused)
+    # A successful fused path must not allocate the fallback's ones vector.
+    monkeypatch.setattr(torch, "ones_like", lambda *a, **k: pytest.fail("unfused normalization"))
+    with op.set_priority(["omni_mps", "native"]):
+        assert op.dispatch(*gpu_args).provider == "omni_mps"
+        actual, summed = op(*gpu_args)
+    assert calls == [True]
+    torch.testing.assert_close(actual.cpu(), expected[0], **op.get_tolerance(dtype))
+    torch.testing.assert_close(actual[0].cpu(), expected[0][0], atol=0, rtol=0)
+    torch.testing.assert_close(summed.cpu(), expected[1], atol=0, rtol=0)
+    for item, before in zip(gpu_args[:3], saved, strict=True):
+        torch.testing.assert_close(item, before, atol=0, rtol=0)
+
+
+@pytest.mark.integration
+@MPS
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "case", ["missing_aot", "strided_x", "strided_residual", "strided_weight", "epsilon"]
+)
+def test_ir_add_rms_norm_keeps_omni_mps_fallback_without_jit(monkeypatch, dtype, case):
+    from vllm_omni_metal import vpipe_kernels
+
+    torch.manual_seed(73)
+    x = torch.randn(2, 3, 514, dtype=dtype, device="mps")
+    residual = torch.randn_like(x)
+    weight = torch.randn(514, dtype=dtype, device="mps")
+    epsilon = 1e-6
+    if case == "strided_x":
+        x, residual, weight = x[..., ::2], residual[..., :257].contiguous(), weight[:257]
+    elif case == "strided_residual":
+        x, residual, weight = x[..., :257].contiguous(), residual[..., ::2], weight[:257]
+    elif case == "strided_weight":
+        x, residual, weight = (
+            x[..., :257].contiguous(),
+            residual[..., :257].contiguous(),
+            weight[::2],
+        )
+    elif case == "epsilon":
+        epsilon = 1e-40
+    saved = [item.clone() for item in (x, residual, weight)]
+    expected = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
+        x.cpu(), residual.cpu(), weight.cpu(), epsilon
+    )
+    monkeypatch.setattr(torch.mps, "compile_shader", lambda _: pytest.fail("worker JIT forbidden"))
+    monkeypatch.setattr(
+        vpipe_kernels,
+        "_library",
+        lambda _: None if case == "missing_aot" else pytest.fail("unsupported shader load"),
+    )
+    monkeypatch.setattr(
+        vpipe_kernels, "add_rms_norm", lambda *a: pytest.fail("unsupported fused dispatch")
+    )
+    op = ir.ops.fused_add_rms_norm
+    with op.set_priority(["omni_mps", "native"]):
+        assert op.dispatch(x, residual, weight, epsilon).provider == "omni_mps"
+        actual = op(x, residual, weight, epsilon)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result.cpu(), reference, **op.get_tolerance(dtype))
+    for item, before in zip((x, residual, weight), saved, strict=True):
+        torch.testing.assert_close(item, before, atol=0, rtol=0)

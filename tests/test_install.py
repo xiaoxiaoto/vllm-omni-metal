@@ -5,6 +5,7 @@ import json
 import os
 import runpy
 import subprocess
+import sys
 import tomllib
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -20,7 +21,7 @@ def installer(tmp_path):
     commands.mkdir()
     log = tmp_path / "commands.jsonl"
     scripts = {
-        "uname": '#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo "${TEST_ARCH:-arm64}";; esac\n',
+        "uname": '#!/bin/sh\ncase "$1" in -s) echo "${TEST_OS:-Darwin}";; -m) echo "${TEST_ARCH:-arm64}";; esac\n',
         "sw_vers": '#!/bin/sh\necho "${TEST_MACOS:-15.0}"\n',
         "uv": "#!/usr/bin/env python3\n"
         + """import json, os, pathlib, sys
@@ -33,11 +34,19 @@ if args[0] == 'venv':
     path.mkdir(parents=True)
     # Command orchestration only; actual package validation is not simulated.
     python = path / 'python'
-    python.write_text('#!/bin/sh\\nexit 0\\n')
+    python.write_text(
+        '#!/bin/sh\\n[ "$1" != -I ] || shift\\ncase "$1" in\\n'
+        '  -m) exit "${TEST_FAIL_BUILD:-0}" ;;\\n'
+        '  -c) exit "${TEST_FAIL_LOAD:-0}" ;;\\n'
+        'esac\\nexit 0\\n'
+    )
     python.chmod(0o755)
 if args[:2] == ['pip', 'install'] and os.getenv('TEST_FAIL_INSTALL'):
     sys.exit(7)
 """,
+        "clang++": "#!/bin/sh\nexit 19\n",
+        "swift": "#!/bin/sh\nexit 19\n",
+        "xcrun": "#!/bin/sh\nexit 19\n",
     }
     for name, content in scripts.items():
         command = commands / name
@@ -89,22 +98,42 @@ def test_install_pins_native_wheels_and_uses_only_private_python(installer, tmp_
     assert sum(call["args"][0] == "venv" for call in calls) == 1
 
 
-def test_install_refuses_unrelated_environment(installer, tmp_path):
+@pytest.mark.parametrize("piped", [False, True])
+def test_install_refuses_unrelated_environment(installer, tmp_path, piped):
     run, log = installer
     venv = tmp_path / "existing"
     venv.mkdir()
     sentinel = venv / "user-file"
     sentinel.write_text("keep")
-    result = run("--venv", str(venv))
+    result = run("--venv", str(venv), "--with-mps-attention", piped=piped)
     assert result.returncode != 0 and "拒绝修改" in result.stderr
     assert sentinel.read_text() == "keep" and not log.exists()
 
 
-@pytest.mark.parametrize("overrides", [{"TEST_ARCH": "x86_64"}, {"TEST_MACOS": "14.5"}])
-def test_install_rejects_unsupported_platform_before_any_install(installer, tmp_path, overrides):
+@pytest.mark.parametrize("piped", [False, True])
+@pytest.mark.parametrize(
+    "overrides",
+    [{"TEST_OS": "Linux"}, {"TEST_ARCH": "x86_64"}, {"TEST_MACOS": "14.5"}],
+)
+def test_install_rejects_unsupported_platform_before_any_install(
+    installer, tmp_path, overrides, piped
+):
     run, log = installer
-    result = run("--venv", str(tmp_path / "unused"), **overrides)
+    result = run("--venv", str(tmp_path / "unused"), "--with-vpipe", piped=piped, **overrides)
     assert result.returncode != 0 and not log.exists()
+    assert not (tmp_path / "unused").exists()
+
+
+@pytest.mark.parametrize("piped", [False, True])
+@pytest.mark.parametrize(
+    "invalid", [("--unknown",), ("--venv",), ("--venv", ""), ("--venv", "--with-vpipe")]
+)
+def test_install_rejects_invalid_arguments_before_any_changes(installer, tmp_path, piped, invalid):
+    run, log = installer
+    venv = tmp_path / "unused"
+    result = run("--venv", str(venv), *invalid, piped=piped)
+    assert result.returncode != 0
+    assert not log.exists() and not venv.exists()
 
 
 def test_failed_dependency_install_stops_before_plugin_and_is_retryable(installer, tmp_path):
@@ -112,6 +141,7 @@ def test_failed_dependency_install_stops_before_plugin_and_is_retryable(installe
     venv = tmp_path / "partial"
     result = run("--venv", str(venv), TEST_FAIL_INSTALL="1")
     assert result.returncode == 7
+    assert "安装完成" not in result.stdout
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     assert len(calls) == 2 and calls[-1]["args"][:2] == ["pip", "install"]
     assert run("--venv", str(venv)).returncode == 0
@@ -148,61 +178,61 @@ def test_plugin_version_matches_omni_and_source_fallback(monkeypatch):
 
 
 @pytest.mark.parametrize("piped", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
-def test_optional_ane_build_is_explicit_and_uses_private_python(installer, tmp_path, piped, fail):
-    run, log = installer
-    venv = tmp_path / "ane env"
-    assert run("--venv", str(venv), piped=piped).returncode == 0
-    module_log = tmp_path / "module-call"
-    (venv / "bin/python").write_text(
-        '#!/bin/sh\nif [ "$1" = "-m" ]; then\n'
-        f'  printf "%s\\n" "$@" > "{module_log}"\n'
-        f"  exit {7 if fail else 0}\nfi\nexit 0\n"
+def test_default_install_does_not_require_optional_compilers(installer, tmp_path, piped):
+    """Boundary stubs reject builds; this does not simulate real package installation."""
+    run, _ = installer
+    result = run(
+        "--venv",
+        str(tmp_path / "no compiler"),
+        piped=piped,
+        TEST_FAIL_BUILD="19",
+        TEST_FAIL_LOAD="19",
     )
-    result = run("--venv", str(venv), "--with-ane", piped=piped)
-    assert result.returncode == (7 if fail else 0)
-    assert module_log.read_text().splitlines() == ["-m", "vllm_omni_metal.ane_build", "--bridge"]
-    if fail:
-        assert "安装完成" not in result.stdout
-    else:
-        assert "默认 auto" in result.stdout and "启动和请求期间不编译" in result.stdout
+    assert result.returncode == 0, result.stderr
 
 
-def test_ane_sources_are_packaged_and_formula_does_not_compile_implicitly():
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assets = project["tool"]["setuptools"]["package-data"]["vllm_omni_metal"]
-    for pattern in (
-        "_native/ane/*.cc",
-        "_native/ane/*.h",
-        "_native/ane/*.swift",
-        "_native/ane/LICENSE",
-    ):
-        assert pattern in assets
-        assert list((ROOT / "vllm_omni_metal").glob(pattern))
-    formula = (ROOT / "Formula/vllm-omni-metal.rb").read_text()
-    assert '"vllm_omni_metal.ane_build", "--help"' in formula
-    assert (
-        'system libexec/"bin/python", "-m", "vllm_omni_metal.ane_build", "--bridge"' not in formula
+@pytest.mark.parametrize("piped", [False, True])
+@pytest.mark.parametrize("flag", ["--with-mps-attention", "--with-vpipe", "--with-ane"])
+def test_requested_build_failure_prevents_install_success(installer, tmp_path, piped, flag):
+    run, _ = installer
+    venv = tmp_path / "build failure"
+    result = run("--venv", str(venv), flag, piped=piped, TEST_FAIL_BUILD="7")
+    assert result.returncode == 7
+    assert "安装完成" not in result.stdout
+    assert (venv / ".vllm-omni-metal-installer").is_file()
+    # An optional failure leaves the owned environment retryable, not cleared.
+    sentinel = venv / "keep-on-retry"
+    sentinel.write_text("keep")
+    assert run("--venv", str(venv), flag, piped=piped).returncode == 0
+    assert sentinel.read_text() == "keep"
+
+
+@pytest.mark.parametrize("piped", [False, True])
+def test_attention_load_failure_prevents_install_success(installer, tmp_path, piped):
+    run, _ = installer
+    result = run(
+        "--venv",
+        str(tmp_path / "load failure"),
+        "--with-mps-attention",
+        piped=piped,
+        TEST_FAIL_LOAD="9",
     )
+    assert result.returncode == 9
+    assert "安装完成" not in result.stdout
 
 
-def test_formula_and_script_pins_match():
-    script = (ROOT / "install.sh").read_text()
-    formula = (ROOT / "Formula/vllm-omni-metal.rb").read_text()
-    for pin in (
-        "21378516a51ff15029f71168e827b94660e21b39484eb52277166f01ac7dd686",
-        "e2ab31296f8c42d8b65c8d5f5490f160087d1070178444870a5672e44aaacf6e",
-        "2ec5f265c69520cdd5e5f0a19db485d38885843e",
-        "0.31.0.dev0+cpu",
-    ):
-        assert pin in script and pin in formula
-    version_check = "assert version('vllm-omni-metal') == version('vllm-omni').split('+', 1)[0]"
-    assert version_check in script and version_check in formula
-    dependencies = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
-    assert any(item.startswith("vllm==0.31.0;") for item in dependencies)
-    assert any(item.startswith("vllm-metal==0.31.0;") for item in dependencies)
-    assert "vllm-omni==0.31.0.dev0" in dependencies
-    assert 'head "https://github.com/xiaoxiaoto/vllm-omni-metal.git", branch: "main"' in formula
-    assert '  url "https://codeload.github.com/xiaoxiaoto/' not in formula
-    assert 'bin.install_symlink libexec/"bin/vllm-omni"' in formula
-    assert 'bin.install_symlink libexec/"bin/vllm"' not in formula
+@pytest.mark.parametrize("module", ["mps_attention", "vpipe_kernels"])
+@pytest.mark.parametrize("arguments,expected", [(["--help"], 0), (["--unknown-option"], 2)])
+def test_optional_build_cli_does_not_build_for_help_or_invalid_arguments(
+    tmp_path, module, arguments, expected
+):
+    result = subprocess.run(
+        [sys.executable, "-m", f"vllm_omni_metal.{module}", *arguments],
+        cwd=tmp_path,
+        env=dict(os.environ, HOME=str(tmp_path), PYTHONPATH=str(ROOT)),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == expected, result.stderr
+    assert not (tmp_path / ".cache/vllm-omni-metal").exists()

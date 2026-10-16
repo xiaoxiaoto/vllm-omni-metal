@@ -2,6 +2,8 @@
 // Adapted from tgo-app-dev/vpipe 6a721d5c3b74ded70001f7c02121f14ae8f5321a.
 // ops/llm_elementwise.metal: packed input stride and cast-before-up for Torch.
 // ops/rope.metal: preserve each Torch product rounding before add/subtract.
+// ops/rms_norm.metal: rms_norm_fast_f16 SIMD reduction, adapted to add BEFORE
+// variance, preserve cast-before-weight, and return a separate rounded sum.
 #include <metal_stdlib>
 using namespace metal;
 #ifndef VPIPE_ELT
@@ -91,3 +93,78 @@ kernel void rope_half_part_ftab_inplace_f16(
   }
 }
 
+// Adapted from vllm-project/vllm-metal f2e26b342c93d6c705ebee0950a0baf8025ee46d,
+// metal/kernels_v2/rope.metal (Apache-2.0). Cache rows are already index-validated
+// by Torch; packed Q/K share one dispatch and need no input clones.
+kernel void rope_qk_cached(
+    const device VPIPE_ELT* q [[buffer(0)]],
+    const device VPIPE_ELT* k [[buffer(1)]],
+    const device VPIPE_ELT* cache [[buffer(2)]],
+    device VPIPE_ELT* out_q [[buffer(3)]],
+    device VPIPE_ELT* out_k [[buffer(4)]],
+    constant long* shape [[buffer(5)]],
+    uint2 index [[thread_position_in_grid]])
+{
+  const uint q_width = shape[0], k_width = shape[1], head = shape[2];
+  const uint pair = index.x, row = index.y, half_head = head / 2;
+  if (pair >= (q_width + k_width) / 2) return;
+  const bool is_q = pair < q_width / 2;
+  const uint local_pair = is_q ? pair : pair - q_width / 2;
+  const uint lane = local_pair % half_head;
+  const uint col = local_pair / half_head * head + lane;
+  const device VPIPE_ELT* input = is_q ? q : k;
+  device VPIPE_ELT* output = is_q ? out_q : out_k;
+  const uint width = is_q ? q_width : k_width;
+  const long base = long(row) * width + col;
+  const long cache_row = long(row) * head;
+  const float c = float(cache[cache_row + lane]);
+  const float s = float(cache[cache_row + lane + half_head]);
+  const float x = float(input[base]), y = float(input[base + half_head]);
+  output[base] = VPIPE_ELT(float(VPIPE_ELT(x * c)) - float(VPIPE_ELT(y * s)));
+  output[base + half_head] = VPIPE_ELT(float(VPIPE_ELT(y * c)) + float(VPIPE_ELT(x * s)));
+}
+
+// Adapted from rms_norm_fast_f16, NOT the semantically different rms_add_f16.
+// One fixed-size threadgroup per row; width is independent of threadgroup size.
+kernel void add_rms_norm_f16(
+    const device VPIPE_ELT* x        [[buffer(0)]],
+    const device VPIPE_ELT* residual [[buffer(1)]],
+    const device VPIPE_ELT* weight   [[buffer(2)]],
+    device VPIPE_ELT* out            [[buffer(3)]],
+    device VPIPE_ELT* summed         [[buffer(4)]],
+    constant int& H                 [[buffer(5)]],
+    constant float& eps             [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint3 tptg     [[threads_per_threadgroup]],
+    uint simd_lid  [[thread_index_in_simdgroup]],
+    uint simd_gid  [[simdgroup_index_in_threadgroup]])
+{
+  const uint base = tid.y * uint(H);
+  const uint lid = ltid.x;
+  const uint tg = tptg.x;
+  const uint nsg = tg / 32;
+  float acc = 0.0f;
+  for (uint i = lid; i < uint(H); i += tg) {
+    const float v = float(x[base + i]) + float(residual[base + i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  threadgroup float partial[32];
+  if (simd_lid == 0) { partial[simd_gid] = acc; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float p = (simd_lid < nsg) ? partial[simd_lid] : 0.0f;
+    p = simd_sum(p);
+    if (simd_lid == 0) { partial[0] = p; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(partial[0] / float(H) + eps);
+  for (uint i = lid; i < uint(H); i += tg) {
+    // Re-read the FP32 sum, never the rounded residual output.
+    const float v = float(x[base + i]) + float(residual[base + i]);
+    const VPIPE_ELT normalized = VPIPE_ELT(v * inv);
+    out[base + i] = VPIPE_ELT(float(normalized) * float(weight[i]));
+    summed[base + i] = VPIPE_ELT(v);
+  }
+}

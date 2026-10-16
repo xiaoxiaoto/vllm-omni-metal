@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm-project/vllm-metal, commit fb9fbc3bd857bee3f7a74f59ee46cc068fa7267c.
-"""Use upstream's PyTorch fused MPS RMSNorm adapter through vLLM IR."""
+"""vLLM IR RMSNorm with optional AOT add-before-norm fusion on MPS."""
 
 import torch
 from vllm import ir
+
+from vllm_omni_metal import vpipe_kernels
 
 
 def _supports_rms_norm(x, weight, epsilon, variance_size=None):
@@ -48,6 +50,10 @@ def fused_add_rms_norm(
     variance_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert weight is not None
+    if vpipe_kernels._supports_add_rms_norm_epsilon(
+        epsilon
+    ) and vpipe_kernels.supports_add_rms_norm(x, x_residual, weight):
+        return vpipe_kernels.add_rms_norm(x, x_residual, weight, epsilon)
     # vLLM requires variance from the unrounded FP32 sum and cast-before-weight ordering.
     summed = x.float() + x_residual.float()
     normalized = torch.nn.functional.rms_norm(

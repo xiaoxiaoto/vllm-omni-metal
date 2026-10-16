@@ -68,24 +68,55 @@ class VllmOmniMetal < Formula
       Python and all backends are installed in a private libexec environment.
       No environment activation is needed. The existing vllm command is unchanged.
 
-      GPU+ANE defaults to auto, requiring explicitly prepared weights and a
-      whole-pipeline profile with >=3% latency reduction; otherwise GPU is kept.
-      Prepare host tools explicitly (requires existing Apple Command Line Tools):
-        #{libexec}/bin/python -m vllm_omni_metal.ane_build --bridge
-      Model adapters must separately approve approximate FP16 math and prepare
-      weight graphs/calibration. No startup/request compilation or model downloads.
+      Optional tools are not built by installation, imports, or --help.
+      Prepare them explicitly with this libexec Python after installation:
+        #{libexec}/bin/python -I -m vllm_omni_metal.mps_attention
+        #{libexec}/bin/python -I -c 'from vllm_omni_metal.mps_attention import get_mps_ops; assert get_mps_ops() is not None'
+        #{libexec}/bin/python -I -m vllm_omni_metal.vpipe_kernels
+        #{libexec}/bin/python -I -m vllm_omni_metal.ane_build --bridge
+      Attention and ANE host tools require existing Apple Command Line Tools.
+      vpipe additionally requires an installed Apple Metal compiler; no tools
+      are downloaded automatically. Missing vpipe compiler is not an install failure.
+      No startup/request compilation, model downloads, conversion, or calibration.
+
+      ANE auto keeps GPU without approved weights and a whole-pipeline profile.
+      Host tools do not establish ANE availability: the real YuE2 graph was
+      rejected (relative L2 5.499% exceeds 1%); no ANE profile was approved.
+      YuE2 generation evidence uses a separate model overlay, not stock Omni.
+      This generic package bundles no model patches, registry, or media.
+      Existing environments and running services are not migrated or restarted;
+      stop services using this libexec before upgrading or preparing its tools.
     EOS
   end
 
   test do
-    system libexec/"bin/python", "-c", <<~PYTHON
+    system libexec/"bin/python", "-I", "-c", <<~PYTHON
+      from importlib import import_module
       from importlib.metadata import entry_points, version
       import torch
       from vllm_omni_metal import is_available
       from vllm_omni_metal.ane import DenseSwiGLU, execution_scope
       from importlib.resources import files
-      for name in ('ane-emitter.cc', 'ane-emitter.h', 'emit.cc', 'bridge.swift', 'LICENSE'):
-          assert files('vllm_omni_metal').joinpath('_native/ane', name).is_file(), name
+      import sys
+      from pathlib import Path
+      import vllm_omni_metal
+      assert Path(vllm_omni_metal.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+      for module in ('mps_attention', 'vpipe_kernels', 'normalization', 'activation', 'rotary',
+                     'ane_build'):
+          import_module(f'vllm_omni_metal.{module}')
+      for resource in (
+          '_native/pytorch_backend/mps_ops.mm',
+          '_native/metal/metal_device.h',
+          '_native/metal/paged_attention_kernels.h',
+          '_native/vpipe_elementwise.metal',
+          '_native/VPIPE.md',
+          '_native/ane/ane-emitter.cc',
+          '_native/ane/ane-emitter.h',
+          '_native/ane/emit.cc',
+          '_native/ane/bridge.swift',
+          '_native/ane/LICENSE',
+      ):
+          assert files('vllm_omni_metal').joinpath(resource).is_file(), resource
       assert version('vllm') == '0.31.0+cpu'
       assert version('vllm-metal') == '0.31.0'
       assert version('vllm-omni') == '0.31.0.dev0+cpu'
@@ -95,7 +126,9 @@ class VllmOmniMetal < Formula
       assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'
                  for e in entry_points(group='vllm_omni.platform_plugins'))
     PYTHON
-    system libexec/"bin/python", "-m", "vllm_omni_metal.ane_build", "--help"
-    system bin/"vllm-omni", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.mps_attention", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.vpipe_kernels", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ane_build", "--help"
+    system libexec/"bin/python", "-I", bin/"vllm-omni", "--help"
   end
 end

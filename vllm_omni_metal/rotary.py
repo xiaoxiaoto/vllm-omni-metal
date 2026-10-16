@@ -40,6 +40,15 @@ class MetalRotaryEmbedding(RotaryEmbedding):
         # Preserve upstream cache construction/scaling, dtype matching and index validation.
         cache = self._match_cos_sin_cache_dtype(query)
         selected = cache.index_select(0, positions.flatten())
+        if (
+            key is not None
+            and self.rotary_dim == self.head_size
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and selected.dtype == query.dtype
+            and selected.shape == (positions.numel(), self.head_size)
+            and selected.is_contiguous()
+        ):
+            return vpipe_kernels.cached_neox_rope_qk(query, key, selected, self.head_size)
         cos, sin = (table.float().contiguous() for table in selected.chunk(2, dim=-1))
         rotated = [
             vpipe_kernels.cached_neox_rope(
