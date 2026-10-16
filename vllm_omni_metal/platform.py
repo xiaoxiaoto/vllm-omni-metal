@@ -26,6 +26,15 @@ class MetalOmniPlatform(OmniPlatform):
         return torch.device("mps")
 
     @classmethod
+    def is_initialized(cls) -> bool:
+        # MPS has no CUDA-style lazy initialization or per-thread device selection.
+        return torch.backends.mps.is_available()
+
+    @classmethod
+    def current_device(cls) -> int:
+        return 0
+
+    @classmethod
     def get_device_count(cls) -> int:
         return int(torch.backends.mps.is_available())
 

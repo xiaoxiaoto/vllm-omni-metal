@@ -139,6 +139,14 @@ def test_dtype_and_cuda_attention_rejected():
         validate_config(config)
 
 
+def test_local_device_uses_single_mps_device(monkeypatch):
+    from vllm_omni.diffusion.distributed import utils
+
+    monkeypatch.setattr(utils, "current_omni_platform", MetalOmniPlatform())
+    monkeypatch.setenv("LOCAL_RANK", "7")
+    assert utils.get_local_device() == torch.device("mps")
+
+
 def test_platform_contract():
     p = MetalOmniPlatform()
     assert p.get_torch_device() == torch.device("mps")
