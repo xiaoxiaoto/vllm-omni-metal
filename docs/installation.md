@@ -44,6 +44,8 @@ python -m pip check
 
 `docker-compose/start.sh` 的模型启动统一调用 `prepare_backend.py`：查询官方最新核心标签与 Omni main，构建独立后端，并从本仓库干净副本构建非 editable wheel。准备器显式选择 `--with-mps-attention`，在选定环境的全新 `-I` 进程中验证 launcher 能加载；源码/native资源、安装脚本及准备器内容均进入指纹，校验通过且构建期间指纹未变才写 `.ready` 并激活。YuE2 私有 overlay 在自己的解释器重复准备与加载验证，不能借基础环境的缓存冒充可用；已有 ready 也会重新验证，失败先撤销 ready。部署模型使用同一版本组，模型私有扩展不进入通用插件、不修改 Homebrew。新官方核心超出兼容矩阵时明确拒绝，不能逐包盲升。
 
+2026-10-16 通用 diffusion SDPA 的 Metal OOT 分派修复已通过上述共享准备器构建非 editable wheel 并完成 Qwen-Image-2.1-Turbo 真实文生图验收，详见[执行合同与本次命令](generic-backend.md#责任边界)。新增 `diffusion_attention.py` 由现有 setuptools 包发现与源码安装/Formula 自动包含，无须变更版本 pins 或 native 资源；源码指纹会触发新隔离后端。仅本地部署已安装，远端未推送，未运行 Homebrew/curl 安装。
+
 更新一个已使用的环境前，先停止所有使用它的服务。本次安装使用新的独立环境，保留运行中的 Higgs 及旧 Homebrew 环境；没有自动迁移服务。
 
 ## 2. Homebrew：发布本次改动后

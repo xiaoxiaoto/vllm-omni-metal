@@ -6,6 +6,28 @@
 
 目前可执行原生 `LLM_AR` 和 `LLM_GENERATION`，以及原有完整 generation / Diffusers pipeline。支持范围限单卡、`uni`、同步调度、未量化 dense decoder；这不是任意 CUDA/Triton 模型或所有 Omni 功能的移植。
 
+完整 generation pipeline 的 diffusion attention 使用 `MetalSDPABackend`：仅覆盖 backend/impl 的选择与 `forward` 入口，直接复用上游 `SDPAImpl._forward_impl` 的 Torch 实现，保留 BSHD 布局、mask、GQA、causal 和 scale 语义。上游默认入口只派发内置 CUDA/ROCm/NPU/XPU/MUSA 平台，因此 OOT Metal 不能直接返回原 `SDPABackend`。不修改上游类、平台枚举或模型 registry，不伪装 CUDA，也不转移张量到 CPU；Diffusers 自己的 attention 路径不受影响。
+
+2026-10-16 本次回归与部署验收：
+
+```bash
+# 保留修复代码，仅在此测试进程恢复旧 backend 选择：应因缺少 Metal forward 而失败。
+VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -c 'import vllm_omni; from vllm_omni_metal.platform import MetalOmniPlatform; MetalOmniPlatform.get_diffusion_attn_backend_cls = classmethod(lambda cls, *a, **k: "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend"); import pytest; raise SystemExit(pytest.main(["-q", "tests/test_diffusion_attention.py::test_platform_forward_matches_independent_reference[fp32-mha]"]))'
+
+VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \
+  tests/test_diffusion_attention.py tests/test_integration.py
+.venv-vllm-omni-metal/bin/python -m pytest -q -m 'not integration'
+.venv-vllm-omni-metal/bin/ruff check .
+.venv-vllm-omni-metal/bin/ruff format --check .
+.venv-vllm-omni-metal/bin/python -m pip check
+```
+
+旧 backend 对照为 1 项预期失败；修复后 8 项真实 MPS attention（FP32/FP16/BF16、MHA/GQA、padding/additive mask、causal、非连续 BSHD、输入不变和非法 head geometry）与 1 项随机 tiny Stable Diffusion 双生命周期生成通过，独立 CPU FP64 reference 检查数值，不用模型名特判。非集成测试 260 项、Ruff、依赖检查通过。
+
+Apple M4 Pro / 48 GiB、macOS 26.6.2（25G83），Torch 2.13.0、Transformers 5.14.1、Diffusers 0.40.0、vLLM/Metal 0.31.0、Omni/Omni Metal 0.31.0.dev0；部署 Omni main 为 `2176457b3d8d621e53bdbfd22a42997c8814704f`。相邻部署运行 `./start.sh qwenimage`，经共享准备器从干净副本构建非 editable wheel（SHA256 `c49ae51c756284f7f68ebebc04a909667315ea2c065a41d13a9b37c868cd2735`），实际安装路径和新实现 MPS 执行已用 `-I` 新进程检查。`install.sh`、Formula 和 setuptools 自动分发新增 Python 模块，无需改依赖或 native 资源；源码指纹自动触发新后端 `0794b39fd3ae1c44`。
+
+统一入口聚合/单模型身份检查及真实 `qwen-image-2.1-turbo` 512×512、8 步、CFG 1、seed 42 请求通过：HTTP 200、`image/png`、1,049,508 字节、27.70 秒，512×512 RGBA 可解码且非单色，目视符合窗台橘猫/蓝天提示。请求命令与部署边界见相邻部署根目录及模型 README；此结果不证明 2K、编辑、seed 字节一致性或生产并发。未重装 Homebrew、未推送远端，其他模型未启动；原有 `platform.py` / `test_plugin.py` 工作区改动保留、不归入本次提交。
+
 通用 dense SwiGLU 的 GPU + ANE 合作 contract、显式 CoreML 准备、完整 pipeline 校准和 FP16 误差边界见[独立协议](ane.md)。该路径不替代完整模型适配入口；未知形状、设备或校准配置保留 GPU。
 
 ## 原生阶段

@@ -130,7 +130,7 @@ class MetalOmniPlatform(OmniPlatform):
             raise ValueError(
                 "Metal diffusion supports TORCH_SDPA only; CUDA kernels cannot run on MPS."
             )
-        return "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend"
+        return "vllm_omni_metal.diffusion_attention.MetalSDPABackend"
 
     @classmethod
     def get_diffusion_worker_cls(cls) -> str:
