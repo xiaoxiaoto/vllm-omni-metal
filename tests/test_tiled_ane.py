@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni_metal import _ane_cache as cache
-from vllm_omni_metal import ane, ane_build
+from vllm_omni_metal.ane import build as ane_build
+from vllm_omni_metal.ane import cache
+from vllm_omni_metal.ane import runtime as ane
 
 
 @pytest.fixture

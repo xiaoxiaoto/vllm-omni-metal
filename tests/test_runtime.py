@@ -16,9 +16,9 @@ from vllm_omni.diffusion.registry import DiffusionModelRegistry
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from vllm_omni_metal import is_available
-from vllm_omni_metal.config import validate_config
-from vllm_omni_metal.runtime import pipeline_runtime, resolve_pipeline_class
-from vllm_omni_metal.worker import MetalDiffusionModelRunner, MetalDiffusionWorker
+from vllm_omni_metal.diffusion.config import validate_config
+from vllm_omni_metal.diffusion.worker import MetalDiffusionModelRunner, MetalDiffusionWorker
+from vllm_omni_metal.execution.runtime import pipeline_runtime, resolve_pipeline_class
 
 
 class NativeSignalPipeline(nn.Module):
@@ -116,17 +116,6 @@ def test_external_pipeline_config_hook(native_config, monkeypatch):
     native_config.custom_pipeline_args = {"unknown": True}
     with pytest.raises(ValueError, match="external pipeline arguments"):
         validate_config(native_config)
-
-
-def test_native_runtime_delegates_upstream_loader(native_config, monkeypatch):
-    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-
-    calls = []
-    monkeypatch.setattr(DiffusionModelRunner, "load_model", lambda *args: calls.append(args))
-    runner = object.__new__(MetalDiffusionModelRunner)
-    runner.od_config = native_config
-    runner.load_model()
-    assert calls == [(runner, None, "default", None)]
 
 
 def test_self_managed_runtime_is_not_model_specific(registry, monkeypatch):

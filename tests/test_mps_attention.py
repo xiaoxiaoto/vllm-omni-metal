@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni_metal import mps_attention
+from vllm_omni_metal.ops import mps_attention
 
 
 def test_missing_artifact_does_not_compile_import_or_create_cache(tmp_path, monkeypatch):
@@ -62,8 +62,8 @@ def test_build_budget_stops_before_creating_artifacts(tmp_path, monkeypatch, ava
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_bridge_keeps_absent_native_provider_for_all_dtypes(monkeypatch, dtype):
-    from vllm_omni_metal import metal_attention
-    from vllm_omni_metal.native_attention import MetalAttentionMetadata
+    from vllm_omni_metal.native.attention import MetalAttentionMetadata
+    from vllm_omni_metal.ops import metal_attention
 
     calls = []
     monkeypatch.setattr(mps_attention, "get_mps_ops", lambda: calls.append("lookup") or None)
@@ -95,8 +95,8 @@ def test_cache_identity_changes_with_torch_version(monkeypatch):
 
 
 def test_strides_over_int32_fail_before_native_cache_write(monkeypatch):
-    from vllm_omni_metal import metal_attention
-    from vllm_omni_metal.native_attention import MetalAttentionMetadata
+    from vllm_omni_metal.native.attention import MetalAttentionMetadata
+    from vllm_omni_metal.ops import metal_attention
 
     class ForbiddenLauncher:
         def forward(self, *args):
@@ -117,7 +117,7 @@ def test_strides_over_int32_fail_before_native_cache_write(monkeypatch):
 
 
 def test_vendored_launcher_only_adapts_fp32_dispatch_from_immutable_upstream():
-    root = Path(mps_attention.__file__).parent / "_native"
+    root = Path(mps_attention.__file__).parents[1] / "_native"
     expected = {
         "pytorch_backend/mps_ops.mm": "cf4d246d5b6fd7388c55fb0d1a2ffa70f868a6f93c5ec3fc69a25762a42cd9d5",
         "metal/metal_device.h": "c706594db1efcc2285ad7a77c070bd233aa1a02636af974325c0589df57edb4f",
@@ -178,8 +178,8 @@ import sys
 sys.modules['mlx'] = None
 sys.modules['mlx.core'] = None
 import torch
-from vllm_omni_metal import mps_attention
-from vllm_omni_metal.native_attention import MetalAttentionImpl, MetalAttentionMetadata
+from vllm_omni_metal.ops import mps_attention
+from vllm_omni_metal.native.attention import MetalAttentionImpl, MetalAttentionMetadata
 assert mps_attention.get_mps_ops() is not None
 def forbidden(*args, **kwargs):
     raise AssertionError('native attention must not synchronize or compile')

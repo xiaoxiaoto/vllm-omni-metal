@@ -11,9 +11,9 @@ from vllm_omni.diffusion.data import AttentionSpec, OmniDiffusionConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 import vllm_omni_metal
-from vllm_omni_metal.config import validate_config
+from vllm_omni_metal.diffusion.config import validate_config
+from vllm_omni_metal.diffusion.worker import MetalDiffusionModelRunner
 from vllm_omni_metal.platform import MetalOmniPlatform
-from vllm_omni_metal.worker import MetalDiffusionModelRunner
 
 
 def make_config(**kwargs):
@@ -157,9 +157,9 @@ def test_platform_contract():
         p.get_torch_device(1)
     with pytest.raises(ValueError):
         p.set_device(torch.device("cpu"))
-    assert p.get_omni_ar_worker_cls() == "vllm_omni_metal.native_worker.MetalARWorker"
+    assert p.get_omni_ar_worker_cls() == "vllm_omni_metal.native.worker.MetalARWorker"
     assert (
-        p.get_omni_generation_worker_cls() == "vllm_omni_metal.native_worker.MetalGenerationWorker"
+        p.get_omni_generation_worker_cls() == "vllm_omni_metal.native.worker.MetalGenerationWorker"
     )
     with pytest.raises(ValueError, match="TORCH_SDPA"):
         p.get_diffusion_attn_backend_cls("FLASH_ATTN", 64)
@@ -199,7 +199,7 @@ def test_compat_patch_preserves_llm_hook(monkeypatch):
     from vllm.config import CompilationMode, CUDAGraphMode
     from vllm_metal.platform import MetalPlatform
 
-    from vllm_omni_metal.compat import apply_compat_patches
+    from vllm_omni_metal.execution.compat import apply_compat_patches
 
     calls = []
 
@@ -227,7 +227,7 @@ def test_compat_patch_preserves_llm_hook(monkeypatch):
 def test_memory_profiler_bridge_is_scoped(monkeypatch):
     import vllm.config
 
-    from vllm_omni_metal.compat import _patch_memory_profiler
+    from vllm_omni_metal.execution.compat import _patch_memory_profiler
 
     class Platform:
         @classmethod

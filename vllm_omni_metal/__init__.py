@@ -22,7 +22,7 @@ def is_available() -> bool:
 
 def _prepare_runtime() -> None:
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    from vllm_omni_metal.compat import apply_compat_patches
+    from vllm_omni_metal.execution.compat import apply_compat_patches
 
     apply_compat_patches()
 

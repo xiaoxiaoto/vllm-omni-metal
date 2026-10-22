@@ -10,12 +10,12 @@
 # 显式同时构建 host 工具；不下载编译工具或模型。
 ./install.sh --with-ane
 # 也可在选定独立环境中单独执行：
-python -m vllm_omni_metal.ane_build --bridge
+python -I -m vllm_omni_metal.ane.build --bridge
 ```
 
-Homebrew 使用 `$(brew --prefix vllm-omni-metal)/libexec/bin/python -m vllm_omni_metal.ane_build --bridge`。需要现有 Apple Command Line Tools 的 clang++/Swift 和 macOS 15+ CoreML；不需要额外安装 Python CoreML 包，亦不要求 `metal` shader compiler。Formula 不在安装过程中自动编译这些可选工具。
+Homebrew 使用 `$(brew --prefix vllm-omni-metal)/libexec/bin/python -I -m vllm_omni_metal.ane.build --bridge`。需要现有 Apple Command Line Tools 的 clang++/Swift 和 macOS 15+ CoreML；不需要额外安装 Python CoreML 包，亦不要求 `metal` shader compiler。Formula 不在安装过程中自动编译这些可选工具。
 
-**host 工具不等于模型加速已准备完成。** 独立模型适配器还须调用 `ane_build.prepare_group(weights, scope=...)`，准备静态权重图和用于溢出恢复的 runtime-weight 图，然后测量自身真实完整生成流程，调用 `publish_profile` 批准对应形状。普通安装不下载权重、不转换任意模型、不运行生成校准。
+**host 工具不等于模型加速已准备完成。** 独立模型适配器还须调用 `vllm_omni_metal.ane.build.prepare_group(weights, scope=...)`，准备静态权重图和用于溢出恢复的 runtime-weight 图，然后测量自身真实完整生成流程，调用 `publish_profile` 批准对应形状。普通安装不下载权重、不转换任意模型、不运行生成校准。
 
 准备产物位于私有 `~/.cache/vllm-omni-metal/ane/<源码/系统/Torch摘要>/`，绑定设备身份、原始权重内容及 dtype、流水线 revision 和执行配置。模型可用 `execution_scope(revision, vllm_config)` 绑定上下文/KV 预算、attention provider 和 IR 设置。通过 `context=` 补充流水线形状，例如关联 attention 的历史长度；不同 context 不共用批准记录。环境、系统、后端源码或权重变化后须显式重新准备。
 
@@ -39,7 +39,7 @@ API 默认 `precision='native'`，不允许透明地把 BF16 解释为 FP16。�
 溢出遵循 vpipe：稳定 SiLU，只有 UP 权重除以 4、16…4096，重跑当前 chunk，FP32 恢复比例后用 Torch RNE 写回源 dtype；静态图不能修改权重，故使用预先准备的 runtime-weight 图恢复。超过上限/恢复后仍非有限则 GPU 重算，不 clipping 或 `nan_to_num`，不放宽门槛。这仅恢复动态范围，不能消除普通舍入误差。
 
 ```python
-from vllm_omni_metal.ane import DenseSwiGLU
+from vllm_omni_metal.ane.runtime import DenseSwiGLU
 
 # 生命周期由已注册模型/独立适配器持有；不是每次 forward 构建。
 group = DenseSwiGLU([(packed_gate_up, down)], scope=pipeline_revision, precision="fp16")
@@ -55,8 +55,8 @@ group.close()
 `TiledDenseSwiGLU` 为独立 gate、up、down 的 bias-free FFN 提供一般 inner 分片，不硬编码模型或增加原256MiB门槛。每片 inner 为1024倍数，按现有限制选择最大合格宽度；例如 hidden4096、inner12288 自动分为10240与2048。逐片准备／哈希，不先为全模型构造巨大的 packed 副本；运行时预算同时计入分片副本、CoreML 与 FP32 归约缓冲。适配器应只绑定资源允许的有限层。
 
 ```python
-from vllm_omni_metal.ane import TiledDenseSwiGLU
-from vllm_omni_metal.ane_build import prepare_tiled_group
+from vllm_omni_metal.ane.runtime import TiledDenseSwiGLU
+from vllm_omni_metal.ane.build import prepare_tiled_group
 
 # 只在显式离线准备阶段执行；原始 BF16 权重不被改写。
 weights = [(gate_weight, up_weight, down_weight)]
@@ -73,7 +73,7 @@ group.close()
 
 2026-10-16，本机通过私有 QwenImage overlay 使用真实官方第0层4096→12288→4096 BF16权重，完成两片静态／runtime图数值自检及1024行小张量协同调用：每片256行ANE、768行GPU，最终相对L2 **0.297%**、峰值归一误差 **0.455%**，无重算或非有限值。图发布前通过CoreML每投影ANE preferred检查；没有采集Instruments硬件trace，没有发布整模型profile。输入是诊断张量，不是模型生成时的实际激活，不能据此宣称图片质量、完整生成速度或全部32层协同已通过。
 
-完整 QwenImage 真实生成校准在启动前被32GiB available门禁拒绝；继续需释放足够内存，不能提高MPS水位或关闭用户其他应用。证据与部署命令见相邻 `docker-compose/qwen-image-2.1-turbo/README.md`，本次最终源码／overlay的真实权重诊断记录在被忽略的 `outputs/qwenimage-real-ffn-20261016-final/`。本次适配保持在模型私有 wheel，不进入本后端 registry。
+QwenImage 真实单层权重 FFN 小张量协同已通过 1% 门禁，但整图验收未通过。当前 Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d` 的第0层真实生成校准执行8次调用／16个 ANE chunk；整图相对L2 **0.6697%**，scaled max **0.1294**（12.94%），超过1%门禁，未发布profile。记录在相邻源码仓库 `outputs/qwenimage-ane-20261016-run2/`；同版本 GPU off/auto 对照见 `outputs/qwenimage-gpu-ab-20261016-run6/`，auto 慢约3.6%。生产融合 AOT 因缺完整 Xcode 未构建，QwenImage 不启用未经批准的 GPU／ANE 路径；部署与限制见相邻 `docker-compose/qwen-image-2.1-turbo/README.md`。适配保持模型私有，不进入本后端 registry。
 
 ## 当前证据边界
 

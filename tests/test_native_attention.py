@@ -3,7 +3,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from vllm_omni_metal.native_attention import MetalAttentionImpl, MetalAttentionMetadata
+from vllm_omni_metal.native.attention import MetalAttentionImpl, MetalAttentionMetadata
 
 
 @pytest.mark.parametrize("chunk_sizes", [[7], [2, 3, 2], [5, 1, 1]])
@@ -118,7 +118,7 @@ def test_native_scratch_budget_covers_small_gqa_partitions_before_initialization
     import sys
     from types import SimpleNamespace
 
-    from vllm_omni_metal.metal_attention import paged_attention
+    from vllm_omni_metal.ops.metal_attention import paged_attention
 
     monkeypatch.setitem(sys.modules, "mlx", None)
     query = torch.empty(1, 32, 128)
@@ -128,7 +128,7 @@ def test_native_scratch_budget_covers_small_gqa_partitions_before_initialization
 
 
 def test_cpu_and_unsupported_geometry_do_not_select_native_kernels():
-    from vllm_omni_metal.metal_attention import supports_paged_attention
+    from vllm_omni_metal.ops.metal_attention import supports_paged_attention
 
     cache = torch.zeros(2, 4, 16, 1, 64)
     assert not supports_paged_attention(torch.ones(1, 2, 64), cache)

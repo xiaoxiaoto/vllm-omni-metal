@@ -9,8 +9,8 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.normalization import RMSNorm
 
-from vllm_omni_metal import diffusion_ops as ops
-from vllm_omni_metal import vpipe_kernels as kernels
+from vllm_omni_metal.diffusion import ops
+from vllm_omni_metal.ops import vpipe_kernels as kernels
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 MPS = pytest.mark.skipif(

@@ -139,23 +139,23 @@ class MetalOmniPlatform(OmniPlatform):
             raise ValueError(
                 "Metal diffusion supports TORCH_SDPA only; CUDA kernels cannot run on MPS."
             )
-        return "vllm_omni_metal.diffusion_attention.MetalSDPABackend"
+        return "vllm_omni_metal.diffusion.attention.MetalSDPABackend"
 
     @classmethod
     def get_diffusion_worker_cls(cls) -> str:
-        return "vllm_omni_metal.worker.MetalDiffusionWorker"
+        return "vllm_omni_metal.diffusion.worker.MetalDiffusionWorker"
 
     @classmethod
     def get_diffusion_model_runner_cls(cls) -> str:
-        return "vllm_omni_metal.worker.MetalDiffusionModelRunner"
+        return "vllm_omni_metal.diffusion.worker.MetalDiffusionModelRunner"
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
-        return "vllm_omni_metal.native_worker.MetalARWorker"
+        return "vllm_omni_metal.native.worker.MetalARWorker"
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
-        return "vllm_omni_metal.native_worker.MetalGenerationWorker"
+        return "vllm_omni_metal.native.worker.MetalGenerationWorker"
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:

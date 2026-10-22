@@ -6,7 +6,7 @@ import os
 import pytest
 import torch
 
-from vllm_omni_metal.native_attention import MetalAttentionImpl, MetalAttentionMetadata
+from vllm_omni_metal.native.attention import MetalAttentionImpl, MetalAttentionMetadata
 
 pytestmark = [
     pytest.mark.integration,
@@ -27,7 +27,7 @@ def test_metal_paged_attention_matches_independent_reference(
     launcher, dtype, head_size, window, monkeypatch
 ):
     if launcher == "bridge":
-        monkeypatch.setattr("vllm_omni_metal.mps_attention.get_mps_ops", lambda: None)
+        monkeypatch.setattr("vllm_omni_metal.ops.mps_attention.get_mps_ops", lambda: None)
     torch.manual_seed(41)
     lengths = [1031, 19]
     counts = [3, 2]

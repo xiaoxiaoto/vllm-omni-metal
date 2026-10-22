@@ -25,13 +25,13 @@ import torch
 def test_benchmark_rejects_unsafe_arguments_before_gpu_allocation(monkeypatch, args, available):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     monkeypatch.setattr("psutil.virtual_memory", lambda: SimpleNamespace(available=available))
-    monkeypatch.setattr(sys, "argv", ["benchmark_attention.py", *args])
+    monkeypatch.setattr(sys, "argv", ["attention.py", *args])
 
     def forbidden(*args, **kwargs):
         raise AssertionError("unsafe benchmark must not allocate GPU tensors")
 
     monkeypatch.setattr(torch, "randn", forbidden)
-    script = Path(__file__).resolve().parents[1] / "examples/benchmark_attention.py"
+    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/attention.py"
     with pytest.raises(SystemExit) as error:
         runpy.run_path(str(script), run_name="__main__")
     assert error.value.code == 2

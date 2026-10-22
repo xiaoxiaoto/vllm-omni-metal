@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from vllm_omni_metal.shm_connector import MetalSharedMemoryConnector
+from vllm_omni_metal.execution.shm_connector import MetalSharedMemoryConnector
 
 
 @pytest.mark.parametrize("with_metadata", [False, True])

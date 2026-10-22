@@ -13,8 +13,8 @@ import torch
 from vllm import ir
 from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
 
-from vllm_omni_metal import normalization  # noqa: F401
-from vllm_omni_metal.compat import _patch_native_ir_priority
+from vllm_omni_metal.execution.compat import _patch_native_ir_priority
+from vllm_omni_metal.ops import normalization  # noqa: F401
 
 
 def test_ir_defaults_are_scoped_idempotent_and_preserve_user_priority(monkeypatch):
@@ -35,7 +35,7 @@ def test_ir_defaults_are_scoped_idempotent_and_preserve_user_priority(monkeypatc
     assert Platform.get_default_ir_op_priority(None).rms_norm == ["native"]
     assert calls == [ordinary, None]
     native = SimpleNamespace(
-        parallel_config=SimpleNamespace(worker_cls="vllm_omni_metal.native_worker.MetalARWorker")
+        parallel_config=SimpleNamespace(worker_cls="vllm_omni_metal.native.worker.MetalARWorker")
     )
     defaults = Platform.get_default_ir_op_priority(native)
     assert defaults.rms_norm == defaults.fused_add_rms_norm == ["omni_mps", "native"]
@@ -69,7 +69,7 @@ def test_fresh_native_worker_registers_provider_without_mlx():
             sys.executable,
             "-c",
             "import sys; sys.modules['mlx'] = None; "
-            "import vllm_omni_metal.native_worker; from vllm import ir; "
+            "import vllm_omni_metal.native.worker; from vllm import ir; "
             "assert 'omni_mps' in ir.ops.rms_norm.impls; "
             "assert 'omni_mps' in ir.ops.fused_add_rms_norm.impls; "
             "assert sys.modules['mlx'] is None",
@@ -94,13 +94,13 @@ def test_fresh_native_worker_registers_provider_without_mlx():
 def test_norm_benchmark_budget_stops_before_allocating(monkeypatch, args, available):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     monkeypatch.setattr("psutil.virtual_memory", lambda: SimpleNamespace(available=available))
-    monkeypatch.setattr(sys, "argv", ["benchmark_normalization.py", *args])
+    monkeypatch.setattr(sys, "argv", ["normalization.py", *args])
 
     def forbidden(*args, **kwargs):
         raise AssertionError("unsafe benchmark must not allocate GPU tensors")
 
     monkeypatch.setattr(torch, "randn", forbidden)
-    script = Path(__file__).resolve().parents[1] / "examples/benchmark_normalization.py"
+    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/normalization.py"
     with pytest.raises(SystemExit) as error:
         runpy.run_path(str(script), run_name="__main__")
     assert error.value.code == 2
@@ -205,7 +205,7 @@ def test_unsupported_mps_norm_arguments_use_native_without_cpu_transfer(case):
 
 @pytest.fixture
 def explicit_norm_shader(monkeypatch):
-    from vllm_omni_metal import vpipe_kernels
+    from vllm_omni_metal.ops import vpipe_kernels
 
     libraries = {}
 
@@ -270,7 +270,7 @@ def test_ir_add_rms_norm_uses_single_kernel_with_upstream_rounding(
     "case", ["missing_aot", "strided_x", "strided_residual", "strided_weight", "epsilon"]
 )
 def test_ir_add_rms_norm_keeps_omni_mps_fallback_without_jit(monkeypatch, dtype, case):
-    from vllm_omni_metal import vpipe_kernels
+    from vllm_omni_metal.ops import vpipe_kernels
 
     torch.manual_seed(73)
     x = torch.randn(2, 3, 514, dtype=dtype, device="mps")

@@ -70,10 +70,10 @@ class VllmOmniMetal < Formula
 
       Optional tools are not built by installation, imports, or --help.
       Prepare them explicitly with this libexec Python after installation:
-        #{libexec}/bin/python -I -m vllm_omni_metal.mps_attention
-        #{libexec}/bin/python -I -c 'from vllm_omni_metal.mps_attention import get_mps_ops; assert get_mps_ops() is not None'
-        #{libexec}/bin/python -I -m vllm_omni_metal.vpipe_kernels --diffusion
-        #{libexec}/bin/python -I -m vllm_omni_metal.ane_build --bridge
+        #{libexec}/bin/python -I -m vllm_omni_metal.ops.mps_attention
+        #{libexec}/bin/python -I -c 'from vllm_omni_metal.ops.mps_attention import get_mps_ops; assert get_mps_ops() is not None'
+        #{libexec}/bin/python -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion
+        #{libexec}/bin/python -I -m vllm_omni_metal.ane.build --bridge
       Attention and ANE host tools require existing Apple Command Line Tools.
       vpipe additionally requires an installed Apple Metal compiler; no tools
       are downloaded automatically. Missing vpipe compiler is not an install failure.
@@ -95,15 +95,52 @@ class VllmOmniMetal < Formula
       from importlib.metadata import entry_points, version
       import torch
       from vllm_omni_metal import is_available
-      from vllm_omni_metal.ane import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
+      from vllm_omni_metal.ane.runtime import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
       from importlib.resources import files
       import sys
       from pathlib import Path
       import vllm_omni_metal
       assert Path(vllm_omni_metal.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
-      for module in ('mps_attention', 'vpipe_kernels', 'normalization', 'activation', 'rotary',
-                     'ane_build', 'diffusion_ops'):
+      for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector',
+                     'native.attention', 'native.compat', 'native.runner', 'native.worker',
+                     'diffusion.attention', 'diffusion.config', 'diffusion.ops', 'diffusion.worker',
+                     'ops.mps_attention', 'ops.metal_attention', 'ops.vpipe_kernels',
+                     'ops.normalization', 'ops.activation', 'ops.rotary',
+                     'quantization.linear', 'quantization.engine',
+                     'quantization.capture', 'quantization.adapter', 'quantization.runtime',
+                     'ane.cache', 'ane.runtime', 'ane.build'):
           import_module(f'vllm_omni_metal.{module}')
+      # CPU-only mixed-precision profile contract (no packing or model execution).
+      from vllm_omni_metal.quantization.linear import build_profile, validate_profile
+      quantization_modules = {
+          'w4': torch.nn.Linear(64, 8, dtype=torch.bfloat16).requires_grad_(False),
+          'w8': torch.nn.Linear(64, 8, dtype=torch.bfloat16).requires_grad_(False),
+          'bf16': torch.nn.Linear(7, 3, dtype=torch.bfloat16).requires_grad_(False),
+      }
+      quantization_profile = build_profile(
+          quantization_modules, list(quantization_modules), scope='installation-contract-v2',
+          calibration={'purpose': 'installation-contract-only'},
+          precisions={'w4': 'w4a16', 'w8': 'w8a16', 'bf16': 'bf16'},
+      )
+      assert quantization_profile['schema'] == 2
+      assert [
+          (item['bits'], item['mode'], item['group_size'])
+          for item in quantization_profile['modules'].values()
+      ] == [(4, 'affine', 64), (8, 'affine', 64), (16, 'identity', None)]
+      assert validate_profile(
+          quantization_profile, quantization_modules, scope='installation-contract-v2',
+      ) == list(quantization_modules)
+      # End CPU-only profile contract.
+      from vllm_omni_metal.platform import MetalOmniPlatform
+      for path in (
+          MetalOmniPlatform.get_omni_ar_worker_cls(),
+          MetalOmniPlatform.get_omni_generation_worker_cls(),
+          MetalOmniPlatform.get_diffusion_worker_cls(),
+          MetalOmniPlatform.get_diffusion_model_runner_cls(),
+          MetalOmniPlatform.get_diffusion_attn_backend_cls(None, 64),
+      ):
+          module, _, symbol = path.rpartition('.')
+          assert isinstance(getattr(import_module(module), symbol), type), path
       for resource in (
           '_native/pytorch_backend/mps_ops.mm',
           '_native/metal/metal_device.h',
@@ -127,9 +164,9 @@ class VllmOmniMetal < Formula
       assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'
                  for e in entry_points(group='vllm_omni.platform_plugins'))
     PYTHON
-    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.mps_attention", "--help"
-    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.vpipe_kernels", "--help"
-    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ane_build", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ops.mps_attention", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ops.vpipe_kernels", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ane.build", "--help"
     system libexec/"bin/python", "-I", bin/"vllm-omni", "--help"
   end
 end

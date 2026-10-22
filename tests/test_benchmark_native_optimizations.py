@@ -23,8 +23,8 @@ import torch
 def test_native_benchmark_stops_before_loading(monkeypatch, args, available):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     monkeypatch.setattr("psutil.virtual_memory", lambda: SimpleNamespace(available=available))
-    monkeypatch.setattr(sys, "argv", ["benchmark_native_optimizations.py", *args])
-    script = Path(__file__).resolve().parents[1] / "examples/benchmark_native_optimizations.py"
+    monkeypatch.setattr(sys, "argv", ["native_optimizations.py", *args])
+    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/native_optimizations.py"
     with pytest.raises(SystemExit) as error:
         runpy.run_path(str(script), run_name="__main__")
     assert error.value.code == 2
@@ -32,10 +32,8 @@ def test_native_benchmark_stops_before_loading(monkeypatch, args, available):
 
 def test_native_benchmark_requires_local_weights(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
-    monkeypatch.setattr(
-        sys, "argv", ["benchmark_native_optimizations.py", "--model", str(tmp_path)]
-    )
-    script = Path(__file__).resolve().parents[1] / "examples/benchmark_native_optimizations.py"
+    monkeypatch.setattr(sys, "argv", ["native_optimizations.py", "--model", str(tmp_path)])
+    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/native_optimizations.py"
     with pytest.raises(SystemExit) as error:
         runpy.run_path(str(script), run_name="__main__")
     assert error.value.code == 2

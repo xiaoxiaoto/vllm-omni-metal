@@ -11,7 +11,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 
 from vllm_omni_metal import is_available
-from vllm_omni_metal.native_runner import MetalNativeModelRunner
+from vllm_omni_metal.native.runner import MetalNativeModelRunner
 
 
 class PlainLanguageModel(nn.Module):
@@ -337,7 +337,7 @@ class NativeKernelTestHooks:
     """Worker extension keeps spies in the child without enabling unsafe RPC serialization."""
 
     def install_test_kernel_spies(self, paged):
-        from vllm_omni_metal import activation, mps_attention
+        from vllm_omni_metal.ops import activation, mps_attention
 
         self._test_silu_calls = []
         self._test_original_silu = activation._silu_and_mul_mps
@@ -374,7 +374,7 @@ class NativeKernelTestHooks:
         return self._test_torch_attention_calls, self._test_native_available
 
     def restore_test_kernel_spies(self):
-        from vllm_omni_metal import activation, mps_attention
+        from vllm_omni_metal.ops import activation, mps_attention
 
         if hasattr(self, "_test_original_silu"):
             activation._silu_and_mul_mps = self._test_original_silu
@@ -436,7 +436,7 @@ def test_two_native_language_architectures_on_mps(
 
     llm = LLM(
         model=str(tmp_path),
-        worker_cls="vllm_omni_metal.native_worker.MetalARWorker",
+        worker_cls="vllm_omni_metal.native.worker.MetalARWorker",
         worker_extension_cls=f"{__name__}.NativeKernelTestHooks",
         distributed_executor_backend="uni",
         dtype=dtype,

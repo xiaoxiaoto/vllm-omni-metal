@@ -13,10 +13,10 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
 
-from vllm_omni_metal import activation
+from vllm_omni_metal.ops import activation
 
 
-def native_config(worker="vllm_omni_metal.native_worker.MetalARWorker"):
+def native_config(worker="vllm_omni_metal.native.worker.MetalARWorker"):
     config = VllmConfig()
     config.parallel_config.worker_cls = worker
     config.compilation_config.custom_ops = ["none", "+silu_and_mul"]
@@ -34,8 +34,8 @@ def test_fresh_worker_registers_operator_not_models_or_original_methods():
             "from vllm.model_executor.models import ModelRegistry; "
             "models = dict(ModelRegistry.models); ops = dict(op_registry); "
             "original = SiluAndMul.forward_native; "
-            "import vllm_omni_metal.native_worker; "
-            "from vllm_omni_metal.activation import MetalSiluAndMul; "
+            "import vllm_omni_metal.native.worker; "
+            "from vllm_omni_metal.ops.activation import MetalSiluAndMul; "
             "assert op_registry_oot['SiluAndMul'] is MetalSiluAndMul; "
             "assert all(op_registry[k] is v for k, v in ops.items()); "
             "assert ModelRegistry.models == models; "
@@ -50,7 +50,7 @@ def test_fresh_worker_registers_operator_not_models_or_original_methods():
 
 
 @pytest.mark.parametrize(
-    "worker", ["auto", "external.Worker", "vllm_omni_metal.native_worker.MetalARWorker"]
+    "worker", ["auto", "external.Worker", "vllm_omni_metal.native.worker.MetalARWorker"]
 )
 def test_operator_scope_and_cpu_fallback(monkeypatch, worker):
     config = native_config(worker)
@@ -67,13 +67,13 @@ def test_operator_scope_and_cpu_fallback(monkeypatch, worker):
         assert isinstance(layer, activation.MetalSiluAndMul)
         actual = layer.forward_oot(x)
     torch.testing.assert_close(actual, SiluAndMul.forward_native(x), atol=0, rtol=0)
-    assert len(calls) == (1 if worker.startswith("vllm_omni_metal.native_worker.") else 0)
+    assert len(calls) == (1 if worker.startswith("vllm_omni_metal.native.worker.") else 0)
     with set_current_vllm_config(config):
         monkeypatch.setattr(activation, "_supports_compiled_silu", lambda x: False)
         layer.forward_oot(x)
-    assert len(calls) == (1 if worker.startswith("vllm_omni_metal.native_worker.") else 0)
+    assert len(calls) == (1 if worker.startswith("vllm_omni_metal.native.worker.") else 0)
     layer.forward_oot(x)  # No active engine configuration must not select the bridge.
-    assert len(calls) == (1 if worker.startswith("vllm_omni_metal.native_worker.") else 0)
+    assert len(calls) == (1 if worker.startswith("vllm_omni_metal.native.worker.") else 0)
 
 
 @pytest.mark.parametrize(
@@ -118,13 +118,13 @@ def test_compilation_gate_is_parameter_based(change, expected):
 def test_activation_benchmark_budget_stops_before_allocating(monkeypatch, args, available):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     monkeypatch.setattr("psutil.virtual_memory", lambda: SimpleNamespace(available=available))
-    monkeypatch.setattr(sys, "argv", ["benchmark_activation.py", *args])
+    monkeypatch.setattr(sys, "argv", ["activation.py", *args])
 
     def forbidden(*args, **kwargs):
         raise AssertionError("unsafe benchmark must not allocate GPU tensors")
 
     monkeypatch.setattr(torch, "randn", forbidden)
-    script = Path(__file__).resolve().parents[1] / "examples/benchmark_activation.py"
+    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/activation.py"
     with pytest.raises(SystemExit) as error:
         runpy.run_path(str(script), run_name="__main__")
     assert error.value.code == 2
@@ -168,7 +168,7 @@ def test_mps_compiled_activation_parity_without_mutation_or_donation(dtype, shap
 @MPS
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_torch_stream_activation_producer_consumer_without_mlx(monkeypatch, dtype):
-    from vllm_omni_metal import vpipe_kernels
+    from vllm_omni_metal.ops import vpipe_kernels
 
     config = native_config()
 

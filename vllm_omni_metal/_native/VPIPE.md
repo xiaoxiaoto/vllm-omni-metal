@@ -41,7 +41,7 @@ this is not a claim that all vpipe kernels or upstream CI passed.
 
 Local tests compile isolated shaders explicitly. Production workers **only load**
 private prebuilt `.metallib` artifacts. Run
-`python -m vllm_omni_metal.vpipe_kernels` explicitly to build using an already
+`python -I -m vllm_omni_metal.ops.vpipe_kernels` explicitly to build using an already
 installed Apple Metal compiler. No compiler/tool download or worker JIT fallback.
 Missing artifacts retain the original paths; invalid artifacts fail explicitly.
 

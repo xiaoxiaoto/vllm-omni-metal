@@ -3,7 +3,7 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni_metal.native_compat import adapt_mps_capture_queries
+from vllm_omni_metal.native.compat import adapt_mps_capture_queries
 
 
 class ValidatedModel(nn.Module):

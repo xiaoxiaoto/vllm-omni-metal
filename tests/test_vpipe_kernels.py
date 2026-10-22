@@ -12,7 +12,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
-from vllm_omni_metal import vpipe_kernels
+from vllm_omni_metal.ops import vpipe_kernels
 
 
 @pytest.mark.parametrize("args", [["--rows", "0"], ["--rows", "128", "--hidden-size", "16384"]])
@@ -21,11 +21,11 @@ def test_benchmark_budget_rejects_before_allocating(monkeypatch, args):
     monkeypatch.setattr(
         vpipe_kernels.psutil, "virtual_memory", lambda: SimpleNamespace(available=8 * 1024**3)
     )
-    monkeypatch.setattr(sys, "argv", ["benchmark_vpipe.py", *args, "--compile-for-test"])
+    monkeypatch.setattr(sys, "argv", ["vpipe.py", *args, "--compile-for-test"])
     monkeypatch.setattr(
         torch.mps, "compile_shader", lambda _: pytest.fail("budget gate must precede compilation")
     )
-    script = Path(__file__).resolve().parents[1] / "examples/benchmark_vpipe.py"
+    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/vpipe.py"
     with pytest.raises(SystemExit) as error:
         runpy.run_path(str(script), run_name="__main__")
     assert error.value.code == 2
@@ -323,10 +323,10 @@ def test_oot_rotary_uses_upstream_cache_and_preserves_other_styles(
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
-    from vllm_omni_metal import rotary
+    from vllm_omni_metal.ops import rotary
 
     config = VllmConfig()
-    config.parallel_config.worker_cls = "vllm_omni_metal.native_worker.MetalARWorker"
+    config.parallel_config.worker_cls = "vllm_omni_metal.native.worker.MetalARWorker"
     config.compilation_config.custom_ops = ["none", "+rotary_embedding"]
     with set_current_vllm_config(config):
         layer = RotaryEmbedding(64, 32, 128, 10000, is_neox, dtype).to("mps")

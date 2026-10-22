@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni_metal.worker import MetalDiffusionWorker
+from vllm_omni_metal.diffusion.worker import MetalDiffusionWorker
 
 
 @pytest.mark.parametrize("fail_after_close", [False, True])

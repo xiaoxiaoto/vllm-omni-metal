@@ -95,11 +95,48 @@ from importlib import import_module
 from importlib.metadata import entry_points, version
 import torch
 from vllm_omni_metal import is_available
-from vllm_omni_metal.ane import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
+from vllm_omni_metal.ane.runtime import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
 from importlib.resources import files
-for module in ('mps_attention', 'vpipe_kernels', 'normalization', 'activation', 'rotary',
-               'ane_build', 'diffusion_ops'):
+for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector',
+               'native.attention', 'native.compat', 'native.runner', 'native.worker',
+               'diffusion.attention', 'diffusion.config', 'diffusion.ops', 'diffusion.worker',
+               'ops.mps_attention', 'ops.metal_attention', 'ops.vpipe_kernels',
+               'ops.normalization', 'ops.activation', 'ops.rotary',
+               'quantization.linear', 'quantization.engine',
+               'quantization.capture', 'quantization.adapter', 'quantization.runtime',
+               'ane.cache', 'ane.runtime', 'ane.build'):
     import_module(f'vllm_omni_metal.{module}')
+# CPU-only mixed-precision profile contract (no packing or model execution).
+from vllm_omni_metal.quantization.linear import build_profile, validate_profile
+quantization_modules = {
+    'w4': torch.nn.Linear(64, 8, dtype=torch.bfloat16).requires_grad_(False),
+    'w8': torch.nn.Linear(64, 8, dtype=torch.bfloat16).requires_grad_(False),
+    'bf16': torch.nn.Linear(7, 3, dtype=torch.bfloat16).requires_grad_(False),
+}
+quantization_profile = build_profile(
+    quantization_modules, list(quantization_modules), scope='installation-contract-v2',
+    calibration={'purpose': 'installation-contract-only'},
+    precisions={'w4': 'w4a16', 'w8': 'w8a16', 'bf16': 'bf16'},
+)
+assert quantization_profile['schema'] == 2
+assert [
+    (item['bits'], item['mode'], item['group_size'])
+    for item in quantization_profile['modules'].values()
+] == [(4, 'affine', 64), (8, 'affine', 64), (16, 'identity', None)]
+assert validate_profile(
+    quantization_profile, quantization_modules, scope='installation-contract-v2',
+) == list(quantization_modules)
+# End CPU-only profile contract.
+from vllm_omni_metal.platform import MetalOmniPlatform
+for path in (
+    MetalOmniPlatform.get_omni_ar_worker_cls(),
+    MetalOmniPlatform.get_omni_generation_worker_cls(),
+    MetalOmniPlatform.get_diffusion_worker_cls(),
+    MetalOmniPlatform.get_diffusion_model_runner_cls(),
+    MetalOmniPlatform.get_diffusion_attn_backend_cls(None, 64),
+):
+    module, _, symbol = path.rpartition('.')
+    assert isinstance(getattr(import_module(module), symbol), type), path
 for resource in (
     '_native/pytorch_backend/mps_ops.mm',
     '_native/metal/metal_device.h',
@@ -124,15 +161,15 @@ assert any(e.name == 'metal' and e.value == 'vllm_omni_metal:register_platform'
            for e in entry_points(group='vllm_omni.platform_plugins'))
 PY
 if [[ "$with_mps_attention" == true ]]; then
-  "$python" -I -m vllm_omni_metal.mps_attention
-  "$python" -I -c 'from vllm_omni_metal.mps_attention import get_mps_ops; assert get_mps_ops() is not None, "Torch-stream attention launcher 未加载"'
+  "$python" -I -m vllm_omni_metal.ops.mps_attention
+  "$python" -I -c 'from vllm_omni_metal.ops.mps_attention import get_mps_ops; assert get_mps_ops() is not None, "Torch-stream attention launcher 未加载"'
 fi
 if [[ "$with_vpipe" == true ]]; then
-  "$python" -I -m vllm_omni_metal.vpipe_kernels --diffusion
+  "$python" -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion
 fi
 if [[ "$with_ane" == true ]]; then
-  "$python" -I -m vllm_omni_metal.ane_build --bridge
+  "$python" -I -m vllm_omni_metal.ane.build --bridge
 fi
-printf '\n可选工具仅显式离线准备；分别使用当前环境：\n  "%s" -m vllm_omni_metal.mps_attention\n  "%s" -m vllm_omni_metal.vpipe_kernels\n  "%s" -m vllm_omni_metal.ane_build --bridge\n启动和请求期间不编译，不自动安装工具、下载权重、转换模型或校准。\n' "$python" "$python" "$python"
+printf '\n可选工具仅显式离线准备；分别使用当前环境：\n  "%s" -I -m vllm_omni_metal.ops.mps_attention\n  "%s" -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion\n  "%s" -I -m vllm_omni_metal.ane.build --bridge\n启动和请求期间不编译，不自动安装工具、下载权重、转换模型或校准。\n' "$python" "$python" "$python"
 printf '\nANE auto 无匹配权重图/整流水线批准 profile 时保留 GPU；host 工具不等于 ANE 可用。\n真实 YuE2 ANE 图 relative L2=5.499%% 超过 1%% 门槛，已拒绝，未批准 ANE。\nYuE2 实测依赖独立模型 overlay；通用安装不捆绑模型补丁/registry/媒体，不保证未补丁 Omni 可运行 YuE2。\n未修改其他环境或重启已有服务；维护已有环境前请先停止使用它的服务。\n'
 printf '\n安装完成。激活环境：\n  source "%s/bin/activate"\n或直接运行：\n  "%s/bin/vllm-omni" serve /path/to/model --omni --deploy-config /path/to/metal-profile.yaml\n' "$venv" "$venv"

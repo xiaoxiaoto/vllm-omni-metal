@@ -9,9 +9,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni_metal import _ane_cache as cache
-from vllm_omni_metal.ane import DenseSwiGLU, _headroom_retry, execution_scope
-from vllm_omni_metal.ane_build import publish_profile
+from vllm_omni_metal.ane import cache
+from vllm_omni_metal.ane.build import publish_profile
+from vllm_omni_metal.ane.runtime import DenseSwiGLU, _headroom_retry, execution_scope
 
 
 @pytest.fixture
@@ -22,13 +22,36 @@ def private_cache(tmp_path, monkeypatch):
     return root
 
 
+@pytest.mark.parametrize("changed", ["ops/activation.py", "ane/runtime.py", "_native/ane/emit.cc"])
+def test_cache_identity_tracks_nested_sources(tmp_path, monkeypatch, changed):
+    package = tmp_path / "vllm_omni_metal"
+    for name in ("ane/cache.py", "ops/activation.py", "ane/runtime.py", "_native/ane/emit.cc"):
+        path = package / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original")
+    monkeypatch.setattr(cache, "__file__", str(package / "ane/cache.py"))
+    cache.cache_root.cache_clear()
+    try:
+        initial = cache.cache_root()
+        source = package / changed
+        original = source.read_text()
+        source.write_text("changed")
+        cache.cache_root.cache_clear()
+        assert cache.cache_root() != initial
+        source.write_text(original)
+        cache.cache_root.cache_clear()
+        assert cache.cache_root() == initial
+    finally:
+        cache.cache_root.cache_clear()
+
+
 def test_execution_scope_uses_real_ir_dataclass_and_resource_settings(tmp_path, monkeypatch):
     from vllm.config import CacheConfig, CompilationConfig
     from vllm.config.kernel import KernelConfig
 
-    monkeypatch.setattr("vllm_omni_metal.mps_attention.get_mps_ops", lambda: None)
+    monkeypatch.setattr("vllm_omni_metal.ops.mps_attention.get_mps_ops", lambda: None)
     monkeypatch.setattr(
-        "vllm_omni_metal.vpipe_kernels._artifact_path", lambda dtype: tmp_path / "absent"
+        "vllm_omni_metal.ops.vpipe_kernels._artifact_path", lambda dtype: tmp_path / "absent"
     )
     config = SimpleNamespace(
         cache_config=CacheConfig(),
@@ -51,7 +74,9 @@ def test_missing_artifacts_keep_gpu_but_invalid_artifacts_fail(private_cache, mo
     monkeypatch.setattr(cache, "weight_shape", lambda *args: (1024, 1024))
     monkeypatch.setattr(cache, "eligible", lambda *args: True)
     monkeypatch.setattr(cache, "weight_key", lambda *args: key)
-    monkeypatch.setattr("vllm_omni_metal.ane._Bridge", lambda: SimpleNamespace(device="test"))
+    monkeypatch.setattr(
+        "vllm_omni_metal.ane.runtime._Bridge", lambda: SimpleNamespace(device="test")
+    )
     (private_cache / "tools.json").write_text("stub")
     identity = cache.group_key([key], "dense-swiglu")
     cache.write_json(
@@ -280,7 +305,7 @@ def test_real_coreml_bridge_and_mps_source_immutability(tmp_path, monkeypatch):
     """Tiny structured FFN only; fake timing is confined to a temporary test cache."""
     root = tmp_path / "private" / "ane" / cache.cache_root().name
     monkeypatch.setattr(cache, "cache_root", lambda: root)
-    from vllm_omni_metal.ane_build import prepare_group
+    from vllm_omni_metal.ane.build import prepare_group
 
     with torch.inference_mode():
         generator = torch.Generator().manual_seed(42)

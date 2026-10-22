@@ -9,11 +9,11 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding, RotaryEmbeddingBase
 
-from vllm_omni_metal import rotary
+from vllm_omni_metal.ops import rotary
 
 
 @pytest.mark.parametrize(
-    "worker", [None, "vllm_omni_metal.native_worker.MetalARWorker", "other.Worker"]
+    "worker", [None, "vllm_omni_metal.native.worker.MetalARWorker", "other.Worker"]
 )
 def test_rotary_cpu_and_unavailable_artifact_retain_native(worker, monkeypatch):
     monkeypatch.setattr(
@@ -47,7 +47,7 @@ def test_rotary_registration_is_oot_not_in_tree():
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_packed_qk_adapter_preserves_scaled_cache_and_position_bounds(monkeypatch, dtype):
-    from vllm_omni_metal import vpipe_kernels
+    from vllm_omni_metal.ops import vpipe_kernels
 
     library = torch.mps.compile_shader(
         f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n" + vpipe_kernels._SOURCE.read_text()
@@ -58,7 +58,7 @@ def test_packed_qk_adapter_preserves_scaled_cache_and_position_bounds(monkeypatc
         "get_current_vllm_config_or_none",
         lambda: SimpleNamespace(
             parallel_config=SimpleNamespace(
-                worker_cls="vllm_omni_metal.native_worker.MetalARWorker"
+                worker_cls="vllm_omni_metal.native.worker.MetalARWorker"
             )
         ),
     )

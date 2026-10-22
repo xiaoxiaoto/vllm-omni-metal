@@ -221,7 +221,7 @@ def test_attention_load_failure_prevents_install_success(installer, tmp_path, pi
     assert "安装完成" not in result.stdout
 
 
-@pytest.mark.parametrize("module", ["mps_attention", "vpipe_kernels"])
+@pytest.mark.parametrize("module", ["ops.mps_attention", "ops.vpipe_kernels"])
 @pytest.mark.parametrize("arguments,expected", [(["--help"], 0), (["--unknown-option"], 2)])
 def test_optional_build_cli_does_not_build_for_help_or_invalid_arguments(
     tmp_path, module, arguments, expected
@@ -236,3 +236,19 @@ def test_optional_build_cli_does_not_build_for_help_or_invalid_arguments(
     )
     assert result.returncode == expected, result.stderr
     assert not (tmp_path / ".cache/vllm-omni-metal").exists()
+
+
+@pytest.mark.parametrize("resource", ["install.sh", "Formula/vllm-omni-metal.rb"])
+def test_install_smoke_checks_include_dynamic_quantization_modules(resource):
+    source = (ROOT / resource).read_text()
+    for module in ("linear", "engine", "capture", "adapter", "runtime"):
+        assert f"'quantization.{module}'" in source
+    assert '"$python" -I -' in source if resource == "install.sh" else 'bin/python", "-I"' in source
+
+
+def test_quantization_python_sources_use_existing_package_discovery():
+    setuptools = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["setuptools"]
+    assert "vllm_omni_metal*" in setuptools["packages"]["find"]["include"]
+    package = ROOT / "vllm_omni_metal" / "quantization"
+    for module in ("__init__", "linear", "engine", "capture", "adapter", "runtime"):
+        assert (package / f"{module}.py").is_file()

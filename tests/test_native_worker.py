@@ -5,7 +5,7 @@ import pytest
 import torch
 from vllm.config import CacheConfig, CompilationConfig, OffloadConfig, ParallelConfig
 
-from vllm_omni_metal.native_worker import MetalNativeWorker, validate_native_config
+from vllm_omni_metal.native.worker import MetalNativeWorker, validate_native_config
 from vllm_omni_metal.platform import MetalOmniPlatform
 
 
@@ -54,9 +54,9 @@ def test_native_config_boundaries(config):
 def test_native_config_enables_only_safe_oot_activation_and_preserves_opt_out(config, ops, flag):
     from vllm_metal.platform import MetalPlatform
 
-    from vllm_omni_metal.compat import apply_compat_patches
+    from vllm_omni_metal.execution.compat import apply_compat_patches
 
-    config.parallel_config.worker_cls = "vllm_omni_metal.native_worker.MetalARWorker"
+    config.parallel_config.worker_cls = "vllm_omni_metal.native.worker.MetalARWorker"
     config.compilation_config = CompilationConfig(custom_ops=ops)
     apply_compat_patches()
     for _ in range(2):
@@ -70,9 +70,9 @@ def test_native_config_enables_only_safe_oot_activation_and_preserves_opt_out(co
 def test_native_config_rejects_conflicting_activation_directives(config, operation):
     from vllm_metal.platform import MetalPlatform
 
-    from vllm_omni_metal.compat import apply_compat_patches
+    from vllm_omni_metal.execution.compat import apply_compat_patches
 
-    config.parallel_config.worker_cls = "vllm_omni_metal.native_worker.MetalARWorker"
+    config.parallel_config.worker_cls = "vllm_omni_metal.native.worker.MetalARWorker"
     config.compilation_config = CompilationConfig(custom_ops=["none"])
     # Hooks can mutate the list after the constructor's validation.
     config.compilation_config.custom_ops.extend([f"+{operation}", f"-{operation}"])
