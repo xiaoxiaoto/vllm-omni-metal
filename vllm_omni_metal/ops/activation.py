@@ -42,7 +42,7 @@ def _silu_and_mul_mps(x: torch.Tensor) -> torch.Tensor:
         return vpipe_kernels.silu_and_mul(x)
 
     import mlx.core as mx
-    from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
+    from vllm_metal.tensor_bridge import mlx_to_torch, torch_to_mlx
 
     shared = torch_to_mlx(x)
     width = x.shape[-1] // 2

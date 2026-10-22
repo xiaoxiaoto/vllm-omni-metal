@@ -8,6 +8,58 @@
 
 完整 generation pipeline 的 diffusion attention 使用 `MetalSDPABackend`：仅覆盖 backend/impl 的选择与 `forward` 入口，直接复用上游 `SDPAImpl._forward_impl` 的 Torch 实现，保留 BSHD 布局、mask、GQA、causal 和 scale 语义。上游默认入口只派发内置 CUDA/ROCm/NPU/XPU/MUSA 平台，因此 OOT Metal 不能直接返回原 `SDPABackend`。不修改上游类、平台枚举或模型 registry，不伪装 CUDA，也不转移张量到 CPU；Diffusers 自己的 attention 路径不受影响。
 
+### 0.32 桥接与分页执行合同修复（2026-10-22）
+
+独立 YuE2 首次真实推理返回HTTP500，根因为旧
+`vllm_metal.pytorch_backend.tensor_bridge` 已移至 `vllm_metal.tensor_bridge`。
+activation、diffusion、量化与分页attention统一使用固定0.32入口，无模型白名单。
+SiLU仍保持FP32计算、乘gate前源dtype舍入及借用存储直到`mx.eval`结束。
+
+真实MPS回归同时暴露分页API合同变化：0.32的
+`paged_attention_primitive` 返回lazy array，不接受旧的output位置参数；
+必须消费其返回值。Torch-stream launcher还须显式绑定reducer的function constant
+130为false（本实现使用dense scratch），以及prefill slot30的`q_block_offset=0`。
+未修改shader、精度、采样或fallback条件。原生源码进入既有cache身份，旧launcher
+不会冒充新构建；部署前显式构建并以新进程确认加载。
+
+本次先在原代码复现两项FP16/BF16激活回归失败，修复后显式构建launcher，
+确认`get_mps_ops()`非空再运行activation、diffusion ops、分页attention、
+quantization、launcher及IR优先级回归：362项通过；随机Llama/Qwen3真实MPS
+多步生成8项通过。完整非集成回归882项通过、5项跳过。没有放宽数值容差。
+移除仅锁定旧launcher源码hash的实现断言，以独立数值、存储生命周期、
+无MLX同步的真实执行回归作为行为证据；IR优先级测试改用实际ParallelConfig，
+保留用户显式优先级断言。
+
+从干净源码副本构建非editable wheel，SHA256
+`aad95166b47df8b4785d493853d506f754a206d606d9dcad6f9a903dc086cb0a`；
+通过现有显式wheel选择安装到独立YuE2 overlay `73cdca6cd88d4c33`，
+复用共享0.32依赖而不切current。45个随包文件逐一匹配wheel与RECORD，
+五个本次变更实现匹配checkout；`-I`实际BF16桥接、launcher及`pip check`通过。
+统一入口两次真实200帧/seed42请求均HTTP200，WAV字节一致，
+48kHz双声道PCM16、7.999秒、有效非静音；首次含冷启动39.583秒，
+再次19.883秒。响应`X-Audio-Truncated:true`，不宣称完整歌曲或听感质量通过。
+根目录`./start.sh yue2`、聚合/单模型身份校验通过，其他模型未停止。
+实际命令与输出位置见相邻部署根目录及YuE2 README。
+
+可复现回归命令（选用已装0.32依赖和pytest的解释器，在源码根目录执行）：
+
+```bash
+VLLM_OMNI_METAL_INTEGRATION=1 <python> -m pytest -q \
+  tests/test_activation.py tests/test_diffusion_ops.py \
+  tests/test_metal_attention.py tests/test_mps_attention.py tests/test_quantization.py \
+  tests/test_normalization.py::test_ir_defaults_are_scoped_idempotent_and_preserve_user_priority
+VLLM_OMNI_METAL_INTEGRATION=1 <python> -m pytest -q \
+  tests/test_native_runner.py::test_two_native_language_architectures_on_mps
+<python> -m pytest -q -m 'not integration'
+```
+
+运行前显式执行`<python> -m vllm_omni_metal.ops.mps_attention`并在新进程断言
+`get_mps_ops()`非空，避免把auto回退bridge误记为native验证。
+本次Ruff check、变更文件format check、Shell/Ruby/Node语法及部署Compose配置通过。
+全仓format check曾报告无关的`ane/projection.py`与
+`tests/test_seedvr2_quantization.py`格式差异，未改写这些已有工作。
+
+
 2026-10-16 本次回归与部署验收：
 
 ```bash

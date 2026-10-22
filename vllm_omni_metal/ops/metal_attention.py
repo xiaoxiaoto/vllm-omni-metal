@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reuse vllm-metal 0.31's published paged kernels, not a second implementation."""
+"""Reuse vllm-metal's published paged kernels, not a second implementation."""
 
 
 def supports_paged_attention(query, cache):
@@ -78,7 +78,7 @@ def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
 
     import mlx.core as mx
     from vllm_metal.metal import get_ops
-    from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
+    from vllm_metal.tensor_bridge import mlx_to_torch, torch_to_mlx
 
     ops = get_ops()
     # The upstream bridge waits for Torch writes; mx.eval completes MLX writes before Torch reuse.
@@ -87,8 +87,7 @@ def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
         for tensor in (query.contiguous(), key.contiguous(), value.contiguous(), cache[0], cache[1])
     )
     kc, vc = ops.reshape_and_cache(k, v, kc, vc, mx.array(slots, dtype=mx.int64))
-    result = mx.array(0)
-    ops.paged_attention_primitive(
+    result = ops.paged_attention_primitive(
         q,
         kc,
         vc,
@@ -101,7 +100,6 @@ def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
         cache.shape[2],
         max_length,
         sliding_window if sliding_window is not None else -1,
-        result,
     )
     mx.eval(result)
     return mlx_to_torch(result, query.device).reshape(rows, -1)

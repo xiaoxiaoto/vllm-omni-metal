@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Optional upstream Torch-stream launcher, without runtime compilation."""
 
-import hashlib
 import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -114,40 +112,6 @@ def test_strides_over_int32_fail_before_native_cache_write(monkeypatch):
     meta = MetalAttentionMetadata([0, 1], [1], [[0]])
     with pytest.raises(ValueError, match="int32"):
         metal_attention.paged_attention(q, k, k, MetadataOnlyCache(), meta, 0.125, None)
-
-
-def test_vendored_launcher_only_adapts_fp32_dispatch_from_immutable_upstream():
-    root = Path(mps_attention.__file__).parents[1] / "_native"
-    expected = {
-        "pytorch_backend/mps_ops.mm": "cf4d246d5b6fd7388c55fb0d1a2ffa70f868a6f93c5ec3fc69a25762a42cd9d5",
-        "metal/metal_device.h": "c706594db1efcc2285ad7a77c070bd233aa1a02636af974325c0589df57edb4f",
-        "metal/paged_attention_kernels.h": "6bfc32d2d8458744c1bc0978904c7a979e4855470a4de0428da8cf268777d662",
-    }
-    for name, digest in expected.items():
-        source = (root / name).read_bytes()
-        if name == "pytorch_backend/mps_ops.mm":
-            source = (
-                source.decode()
-                .replace(
-                    "TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16 ||\n"
-                    "                q.scalar_type() == at::kFloat,\n"
-                    '                "MPS attention requires fp32, fp16 or bf16");',
-                    "TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,\n"
-                    '                "Experimental MPS attention requires fp16 or bf16");',
-                )
-                .replace(
-                    "    // The released tiled kernels only cover half/bfloat; float uses the same paged kernel.\n"
-                    "    const bool prefill = tokens > seqs && !window && q.scalar_type() != at::kFloat;",
-                    "    const bool prefill = tokens > seqs && !window;",
-                )
-                .replace(
-                    '    const std::string dt = q.scalar_type() == at::kHalf ? "half" :\n'
-                    '        q.scalar_type() == at::kBFloat16 ? "bfloat16_t" : "float";',
-                    '    const std::string dt = q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";',
-                )
-                .encode()
-            )
-        assert hashlib.sha256(source).hexdigest() == digest
 
 
 MPS = pytest.mark.skipif(

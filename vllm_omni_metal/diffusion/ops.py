@@ -78,7 +78,7 @@ def silu_mul(gate, up, *, _validated=False):
             return _record("silu_mul", "aot", result)
         if _validated or gate.numel() >= _MIN_COMPILED_ELEMENTS:
             import mlx.core as mx
-            from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
+            from vllm_metal.tensor_bridge import mlx_to_torch, torch_to_mlx
 
             from vllm_omni_metal.ops.activation import _compiled_silu_and_mul
 

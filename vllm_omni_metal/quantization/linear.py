@@ -220,7 +220,7 @@ def _environment():
         }
     bridge = Path(
         importlib.metadata.distribution("vllm-metal").locate_file(
-            "vllm_metal/pytorch_backend/tensor_bridge.py"
+            "vllm_metal/tensor_bridge.py"
         )
     )
     device = {}
@@ -355,7 +355,7 @@ class QuantizedLinear(torch.nn.Module):
         _bits(bits)
         tensors = _linear(linear, mps=True, bits=bits)
         import mlx.core as mx
-        from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+        from vllm_metal.tensor_bridge import torch_to_mlx
 
         module = cls.__new__(cls)
         torch.nn.Module.__init__(module)
@@ -409,7 +409,7 @@ class QuantizedLinear(torch.nn.Module):
             result = x.new_empty((*x.shape[:-1], self.out_features))
         else:
             import mlx.core as mx
-            from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
+            from vllm_metal.tensor_bridge import mlx_to_torch, torch_to_mlx
 
             with mx.stream(mx.gpu):
                 shared = torch_to_mlx(x)

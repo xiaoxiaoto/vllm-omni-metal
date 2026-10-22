@@ -192,13 +192,15 @@ def test_torch_stream_activation_producer_consumer_without_mlx(monkeypatch, dtyp
 @pytest.mark.integration
 @MPS
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_activation_cast_before_gate_is_discriminating(dtype):
+def test_activation_cast_before_gate_is_discriminating(monkeypatch, dtype):
     gate = torch.linspace(-3, 3, 257).to(dtype)
     up = torch.tensor([1.25, 1.75, 0.75, 1.5], dtype=dtype).repeat(65)[:257]
     expected = torch.nn.functional.silu(gate) * up
     unrounded = (torch.nn.functional.silu(gate.float()) * up.float()).to(dtype)
     mask = expected != unrounded
     assert mask.sum() > 50
+    # Exercise the bridge even when an optional Torch-stream artifact is installed.
+    monkeypatch.setattr(activation.vpipe_kernels, "supports_silu", lambda _: False)
     actual = activation._silu_and_mul_mps(torch.cat([gate, up]).to("mps")).cpu()
     torch.testing.assert_close(actual[mask], expected[mask], atol=0, rtol=0)
 

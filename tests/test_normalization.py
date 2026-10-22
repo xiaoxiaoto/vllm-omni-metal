@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm import ir
+from vllm.config import ParallelConfig
 from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
 
 from vllm_omni_metal.execution.compat import _patch_native_ir_priority
@@ -35,7 +36,7 @@ def test_ir_defaults_are_scoped_idempotent_and_preserve_user_priority(monkeypatc
     assert Platform.get_default_ir_op_priority(None).rms_norm == ["native"]
     assert calls == [ordinary, None]
     native = SimpleNamespace(
-        parallel_config=SimpleNamespace(worker_cls="vllm_omni_metal.native.worker.MetalARWorker")
+        parallel_config=ParallelConfig(worker_cls="vllm_omni_metal.native.worker.MetalARWorker")
     )
     defaults = Platform.get_default_ir_op_priority(native)
     assert defaults.rms_norm == defaults.fused_add_rms_norm == ["omni_mps", "native"]
