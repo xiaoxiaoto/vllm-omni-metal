@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-# Match stable 0.31 native wheels with a frozen Omni main snapshot.
-vllm_url='https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl#sha256=21378516a51ff15029f71168e827b94660e21b39484eb52277166f01ac7dd686'
-metal_url='https://github.com/vllm-project/vllm-metal/releases/download/v0.31.0/vllm_metal-0.31.0-cp312-cp312-macosx_15_0_arm64.whl#sha256=e2ab31296f8c42d8b65c8d5f5490f160087d1070178444870a5672e44aaacf6e'
-omni_commit="${VLLM_OMNI_COMMIT:-2ec5f265c69520cdd5e5f0a19db485d38885843e}"
+# Pair the vLLM/Metal 0.32 wheels with the Omni 0.32 development snapshot.
+vllm_url='https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl#sha256=c28cf0fede58f02c4886d2794217ec3c7e4bbd22dfeb16b4b32586a8f230bb75'
+metal_url='https://github.com/vllm-project/vllm-metal/releases/download/v0.32.0/vllm_metal-0.32.0-cp312-cp312-macosx_15_0_arm64.whl#sha256=458d34157eb02a6bfb0e293c70485df18f72b7eb1d1ce8f1eefea95ba47ab63c'
+omni_commit="${VLLM_OMNI_COMMIT:-d6db19b41f8c081506468859cd8f3910f77f1e5c}"
 [[ "$omni_commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'VLLM_OMNI_COMMIT 必须是完整 Git commit' >&2; exit 1; }
 omni_source="vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@${omni_commit}"
 plugin_url='vllm-omni-metal @ git+https://github.com/xiaoxiaoto/vllm-omni-metal.git@main'
@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
     --with-ane) with_ane=true; shift ;;
     -h|--help)
       printf '%s\n' '用法：install.sh [--venv PATH] [--with-mps-attention] [--with-vpipe] [--with-ane]' \
-        '安装匹配的 vLLM CPU / vllm-metal 0.31.0 wheel、Omni CPU 包和本插件。' \
+        '安装 vLLM CPU / vllm-metal 0.32.0 官方 wheel、Omni CPU 包和本插件。' \
         '源码运行默认创建 .venv-vllm-omni-metal（editable）；curl 运行创建 ~/.venv-vllm-omni-metal。' \
         '不修改系统 Python、Homebrew libexec、已有 .venv 或运行中的服务。' \
         '默认不编译可选工具；所有显式构建均在选定私有 Python 安装完成后离线执行。' \
@@ -81,14 +81,15 @@ assert platform.machine() == 'arm64', 'Python 必须是原生 arm64'
 assert sys.prefix != sys.base_prefix, '拒绝安装到系统 Python'
 PY
 # Omni's actual selector is VLLM_OMNI_TARGET_DEVICE, not VLLM_TARGET_DEVICE.
-export VLLM_OMNI_TARGET_DEVICE=cpu VLLM_OMNI_VERSION_OVERRIDE=0.31.0.dev0+cpu
+export VLLM_OMNI_TARGET_DEVICE=cpu VLLM_OMNI_VERSION_OVERRIDE=0.32.0.dev0+cpu
 if [[ -n "$source_dir" ]]; then
   plugin_args=(-e "$source_dir")
 else
   plugin_args=("$plugin_url")
 fi
-# Keep the native wheel's Git dependencies visible in the same resolution.
-uv pip install --python "$python" "$vllm_url" "$metal_url" "$omni_source" "${plugin_args[@]}"
+# Rebuild Omni metadata from the pinned source; uv may cache metadata from a prior version override.
+uv pip install --python "$python" --no-cache \
+  "$vllm_url" "$metal_url" "$omni_source" "${plugin_args[@]}"
 uv pip check --python "$python"
 "$python" -I - <<'PY'
 from importlib import import_module
@@ -96,6 +97,7 @@ from importlib.metadata import entry_points, version
 import torch
 from vllm_omni_metal import is_available
 from vllm_omni_metal.ane.runtime import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
+from vllm_omni_metal.quantization.capture import CaptureSession, DiskCaptures
 from importlib.resources import files
 for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector',
                'native.attention', 'native.compat', 'native.runner', 'native.worker',
@@ -104,7 +106,7 @@ for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector
                'ops.normalization', 'ops.activation', 'ops.rotary',
                'quantization.linear', 'quantization.engine',
                'quantization.capture', 'quantization.adapter', 'quantization.runtime',
-               'ane.cache', 'ane.runtime', 'ane.build'):
+               'ane.cache', 'ane.runtime', 'ane.build', 'ane.projection', 'ane.allocation'):
     import_module(f'vllm_omni_metal.{module}')
 # CPU-only mixed-precision profile contract (no packing or model execution).
 from vllm_omni_metal.quantization.linear import build_profile, validate_profile
@@ -151,9 +153,9 @@ for resource in (
     '_native/ane/LICENSE',
 ):
     assert files('vllm_omni_metal').joinpath(resource).is_file(), resource
-assert version('vllm') == '0.31.0+cpu'
-assert version('vllm-metal') == '0.31.0'
-assert version('vllm-omni') == '0.31.0.dev0+cpu'
+assert version('vllm') == '0.32.0+cpu'
+assert version('vllm-metal') == '0.32.0'
+assert version('vllm-omni') == '0.32.0.dev0+cpu'
 assert version('vllm-omni-metal') == version('vllm-omni').split('+', 1)[0]
 assert is_available(), 'MPS 不可用'
 assert torch.Generator(device='mps') is not None

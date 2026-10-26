@@ -129,7 +129,11 @@ def test_self_managed_runtime_is_not_model_specific(registry, monkeypatch):
     runner = object.__new__(MetalDiffusionModelRunner)
     runner.od_config = config
     runner.pipeline = None
-    runner.load_model()
+
+    def forbidden_torch_lora():
+        pytest.fail("self-managed MLX loading must not initialize a PyTorch LoRA manager")
+
+    runner.load_model(initialize_lora=forbidden_torch_lora)
     assert isinstance(runner.pipeline, SelfManagedPipeline) and runner.pipeline.loaded
     assert runner.model_memory_usage == 16
     params = OmniDiffusionSamplingParams(seed=42)

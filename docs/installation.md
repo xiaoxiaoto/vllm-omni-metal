@@ -1,17 +1,25 @@
-# 安装与 0.31 升级
+# 安装与 vLLM / Metal / Omni 0.32 兼容栈
 
 使用独立 Python 3.12 环境和官方 macOS arm64 wheel，不修改系统 Python、原有 `.venv` 或 vllm-metal 的 Homebrew 私有环境。
 
 ## 固定依赖
 
 - 原生 Apple Silicon、macOS **15+**，不支持 Rosetta。
-- vLLM **0.31.0+cpu** 和 vllm-metal **0.31.0**（本次核对的最新稳定版），官方预编译 wheel，SHA256 固定在 Formula 和安装器。
-- Omni 最新稳定 tag 仍为 0.30.0。为使用 YuE2 等新集成，固定 main **`2ec5f265c69520cdd5e5f0a19db485d38885843e`**，构建为 **`0.31.0.dev0+cpu`**，明确是开发快照，不冒充稳定 release。
-- 插件版本为 **`0.31.0.dev0`**，跟随固定 Omni 的公开版本；`+cpu` 仅为 Omni 构建标记。后续升级须同步插件元数据、源码回退版本及 Omni 依赖，安装器和 Formula 测试会校验版本一致。
-- 构建设置 `VLLM_OMNI_TARGET_DEVICE=cpu` 和 `VLLM_OMNI_VERSION_OVERRIDE=0.31.0.dev0+cpu`；前者不是 `VLLM_TARGET_DEVICE`。
-- 本次完整解析得到 PyTorch 2.13.0、Transformers 5.14.1、MLX 0.32.1、diffusers 0.40.0。Omni 限定 Transformers `>=5.13,<5.15`；不能绕过这些约束只升级某个包。
+- vLLM **0.32.0+cpu**（官方 macOS arm64 `cp38-abi3` wheel）和 vllm-metal **0.32.0**（官方 macOS 15+ arm64 wheel）；SHA256 固定在 Formula 和安装器。
+- Omni 官方 main commit **`d6db19b41f8c081506468859cd8f3910f77f1e5c`**，以 `VLLM_OMNI_VERSION_OVERRIDE=0.32.0.dev0+cpu` 构建；插件为 `0.32.0.dev0`。
+- vLLM / Metal 0.32 要求 Transformers `>=5.16.1,<5.20.0`；Omni 0.31 的 `<5.15` 冲突已通过升级 Omni 与插件版本合同解决。Omni 构建含本地版本标签 `+cpu`，插件依赖以 `>=0.32.0.dev0` 接受该构建标记。
+- vLLM 0.32.0 和 vllm-metal 0.32.0 按官方配套发布对齐；vllm-metal 发布说明要求该版本对应 vLLM 0.32.0。
 
-本插件的默认安装无需编译 Metal kernel；可选 Torch-stream attention 复用上游 host-only launcher（仅补齐已发布 FP32 kernel 的 host dtype/路由选择），需用户显式编译 Objective-C++ host extension，不编译新 shader。安装需要联网下载依赖和 Git 源码，不下载模型。不要用 PyPI CUDA vLLM wheel 替代 macOS CPU wheel，也不能把最新 Omni main 与 vLLM 0.30 混装。
+本版本合同来自官方 main 开发快照，不将开发版号伪装成稳定发布版。安装器和 Formula 均固定同一 Omni commit、版本覆盖和 wheel SHA256；`pip check` 与新隔离解释器验证必须通过后才可使用。
+
+0.32 的跨框架桥接位于 `vllm_metal.tensor_bridge`，不再使用
+`vllm_metal.pytorch_backend.tensor_bridge`。本插件的 activation、diffusion、
+分页 attention 和量化调用点统一按固定0.32合同构建，不提供0.31布局 shim。
+这些 Python 模块由现有 setuptools、源码/curl 安装器及 Formula 自动分发；
+仅修改 checkout 不会更新已有部署。独立 YuE2 可以通过
+`VLLM_OMNI_METAL_WHEEL` 选择新构建的非 editable wheel，复用既有共享依赖，
+而不切换共享 `current` 或升级其他模型；私有 ready 与 attention launcher
+仍须在该 overlay 的 `-I` 解释器下重新校验。
 
 ## 内部 API 功能分包切换
 
@@ -28,7 +36,8 @@
 安装资源同步复验：`python -m pytest -q tests/test_install.py tests/test_deployment_prepare.py` 为69项通过，覆盖本地／管道安装、安全边界及独立部署准备器；Shell／Ruby语法、Ruff check与format check通过。从干净副本再次用所选Python `-I -m pip wheel --no-deps --no-build-isolation` 构建并在临时venv非editable安装（复用现有依赖），直接执行 `install.sh` 和Formula中实际的Python校验片段均通过；39个包文件完整、三个构建入口的隔离help通过。移除临时安装中的 `execution/shm_connector.py` 后，实际安装校验因模块缺失而失败，未误报成功。未执行联网全依赖安装、Homebrew安装或远端curl入口；未编译可选产物、迁移环境或重启服务。
 
 
-## 1. 当前源码：已实际安装验证
+## 1. 当前源码：0.32 本地资源，完整安装尚未复验
+本地安装器、Formula 和包元数据已对齐 vLLM / vllm-metal 0.32.0、Omni `0.32.0.dev0+cpu` 与插件 `0.32.0.dev0`。复用既有0.32依赖的独立 wheel 安装校验不等于全依赖新安装通过；下列完整安装流程尚未在本次重新执行，远端资源也未发布。
 
 ```bash
 cd /path/to/vllm-omni-metal
@@ -71,9 +80,7 @@ python -I -m pip check
 
 ## 2. Homebrew：发布本次改动后
 
-0.31 固定栈及此前源码已发布，但本次新增 vpipe/FP32 算子与验收改动尚未提交/推送；远端 HEAD 不会自动包含工作树。新 Formula **仅支持 HEAD**：旧 0.1.0 源码快照要求 0.30，不能作为新栈的稳定源码冒用；暂无匹配新栈的已发布插件 release。
-
-发布配套源码与 Formula 后：
+配套源码与 Formula 发布后可按下列流程安装；本次未重新安装 Homebrew，也未验证远端 tap/curl，不能将本地资源同步等同于已发布。
 
 ```bash
 brew tap xiaoxiaoto/vllm-omni-metal https://github.com/xiaoxiaoto/vllm-omni-metal
@@ -164,8 +171,80 @@ MLX自管理对象必须提供显式scope/apply hook，不支持的融合/分片
 FP16/BF16搜索和执行保留源dtype，FP32只支持identity；不强制转BF16，允许全部identity，
 但不能声称量化收益。私有模型仍自行负责真实执行捕获与整任务质量批准。
 完整接口、managed元数据和hook合同见[通用DynamicEngine](generic-backend.md#通用-dynamicengine-加载合同)。
-本次安装资源改动未运行构建、安装或回归，没有真实四模型质量/速度新结论；
-没有自动启用、迁移部署、重启服务或发布远端。以下数字均为独立历史记录。
+新的单线性投影 ANE 与联合量化安装资源、实测边界见下节；没有真实四模型
+质量/速度的共同批准，不自动启用、迁移部署、重启服务或发布远端。之后的旧记录均为独立历史证据。
+
+### 单投影 ANE 与联合量化安装资源
+
+普通 wheel 自动包含 `ane/projection.py`、更新后的 C++ emitter 和 Swift bridge；
+现有 package-data 已包含全部 native 源码与许可证，不打包本机编译产物、权重或 profile。
+源码/curl 的 `install.sh` 和 Formula 烟测均导入新 API；共享准备器核验
+`DenseProjection`／`prepare_projection`，三个私有准备器从当前干净后端源码构建 wheel。
+模型私有联合适配器及校准器仍归各自正常 Omni wheel 所有，按源码 SHA、RECORD、
+来源指纹与 ready 校验，不能向已安装上游复制补丁。
+
+当前已在复用既有0.32依赖的临时 venv 中非 editable 安装干净 wheel，并以所选
+Python `-I` 执行显式 ANE host 构建及真实 BF16 biased 线性投影：
+256行 ANE、257行 GPU，relative L2 0.10183%、scaled max 0.48309%，没有发布批准。
+最终干净wheel复验：完整非集成906项通过（5 skipped、334 deselected），小型真实
+MPS／ANE及三个私有适配器回归131项通过。Ruff check／format check、安装器及三个
+启动脚本的独立 `bash -n`、Formula `ruby -c` 均通过。三个正常私有准备器的构建、
+非 editable 安装、来源/资源/RECORD/许可证及依赖校验通过；依赖由显式 `.pth` 复用，
+这不是全依赖重新安装或服务迁移。
+旧开发 `.venv-vllm-omni-metal` 仍为0.31，不用于0.32桥接验收，也没有被本次升级。
+
+完整模型没有联合批准：Higgs真实TTS四层down均局部选W8，但候选656次量化调用、
+ANE chunks=0；短输入不填充，候选与原精度波形长度也不同。独立核验6个24kHz单声道
+WAV与7个有限值FP32 NPY，原精度双语同seed逐位重复，零ANE候选与quant-only逐位相同。
+Qwen真实联合CLI在启动前available27.31GiB时被32GiB门槛拒绝；后续资源复核仅19.24GiB。
+Seed联合CLI在模型worker创建前因缺7B索引拒绝，当前仅有3B缓存且未提供真实输入。
+因此三者均不设联合默认，不下载权重、不制造输入、不停止其它服务。
+本轮证据：`outputs/joint-ane-dynamic-20261022-222638/`；保留既有依赖警告，
+不声称完整安装、真实图片/超分、听感/ASR或速度收益通过，未发布远端资源。
+
+### 2026-10-23：Qwen真实启动接口修复
+
+实际启动先暴露上游0.32 `initialize_lora` 加载回调签名变化；共享diffusion runner
+按原合同接收并传递给Torch加载路径，自管理MLX不执行Torch回调，未增加LoRA能力。
+`diffusion/worker.py` 由现有包发现/安装器/Formula校验分发，入口和依赖无新增；
+所有私有准备器递归源码指纹包含此次变更，旧ready不能替代当前源码校验。
+
+从干净后端副本构建非editable wheel，在临时独立环境复用既有0.32依赖，
+真实MPS小流水线和MLX生命周期回归6项通过。正常Qwen准备器成功构建并校验
+独立 `77b751e47c56c325`，重跑已越过原签名错误进入真实权重加载。
+随后Qwen的NPU专用SDPA覆写错误触发Metal继承校验；私有补丁仅在NPU注册该覆写，
+不绕过验证，正常重建 `feb09f3c459a18e5` 并通过真实MPS attention数值回归。
+上述环境只显式 `.pth` 复用既有基础依赖，不是全依赖重装；共享current与服务未切换。
+ANE host工具已在选定私有Python `-I` 下显式构建；完整联合结果须另看本轮真实记录，
+不能将安装、加载权重或小型回归视为图片质量/速度批准。
+
+最终完整非集成958项通过（5 skipped、336 deselected），Ruff check/format及
+Shell/Ruby语法通过。以官方0.32基础依赖实际执行安装器/Formula Python校验段，
+并验证新backend wheel完整源码/资源/许可证与RECORD，均通过。
+完整Qwen重跑在修复后的环境被启动资源门槛拒绝，最终复核available24.70GiB；
+未生成图片或发布联合批准。详细证据为
+`outputs/qwen-joint-direct-20261023-100747-verification.json`及对应三个真实尝试目录。
+
+### 2026-10-23：vpipe预测分配复验
+
+新增 `ane/allocation.py` 随现有包发现规则分发，无额外依赖、entry point或native资源变化。
+源码/curl共用安装器及Formula的实际Python校验清单均导入该模块。共享/私有准备器
+递归源码指纹自然覆盖分配器与投影变更；已有ready、图缓存或profile不能当成本轮批准。
+外部适配器须显式接入离线 `set_benchmark_chunks("auto")`，生产冻结profile语义不变。
+
+从干净副本构建0.32 wheel，在临时独立venv非editable安装，显式 `.pth` 复用既有0.32
+依赖；所选Python `-I` 构建ANE工具并实际运行1025×1024 BF16 biased投影。
+8次自适应审计中真实分配经历2→3→2→1块，随后2次冻结执行；总计19个ANE块、
+4864行ANE及5386行GPU。实际各split完整投影relative L2最高0.12357%、
+scaled max最高0.45663%，未发布profile，不据此声称模型提速。
+
+预测边界和真实NE冻结回归68项通过；完整非集成958项通过（5 skipped、335 deselected）。
+实际执行安装器和Formula内嵌Python校验段、完整源码/资源/许可证/RECORD检查均通过；
+Ruff check/format、`bash -n install.sh`、`ruby -c Formula/vllm-omni-metal.rb`通过。
+未执行完整Homebrew安装或远端curl，不修改既有环境、服务或部署默认。
+证据：`outputs/higgs-joint-smallrows-20261023-091229/allocation-verification.json`。
+分配预测不解除256行分块，不代表Higgs短输入联合执行或完整音频质量已通过；
+本轮按用户新优先级只实施通用分配策略，未继续修改Higgs小图/选层流程。
 
 ### 2026-10-22：DynamicEngine 子包与动态部署切换
 
@@ -364,5 +443,47 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q
 **本次安装资源同步验收：** 从干净副本重新构建 wheel，并在临时非 editable 环境安装；依赖通过显式 `.pth` 复用所选开发环境，没有重新解析完整依赖。安装后的全部30个包文件（含10项 native资源）与当前源码逐字节一致。使用仅替代 Homebrew 声明 DSL 的临时执行器，实际运行 Formula 的测试块：cwd/PYTHONPATH 污染场景修复前失败，改用所选 Python `-I` 后通过，覆盖版本、MPS generator、资源及四个 CLI help；这不是实际 `brew install/test`。安装/部署回归54项通过，Ruff、格式与shell/Ruby语法通过。持续同步指令已写入 `AGENTS.md`，临时环境与执行器已清理；未发布、切换服务或重跑模型生成。
 
 未补丁 Omni 的 YuE2 模型级 MPS 障碍仍需独立适配；私有 `yue2mps2` overlay 已有真实512帧歌曲与 attention 对照，但不代表普通安装开箱可用，见 [接入状态](yue2-readiness.md)。PyAV/OpenCV/系统 FFmpeg 存在重复 Objective-C 类警告，本轮安装/CLI未因此失败，媒体视频路径未额外验收。
+
+### 2026-10-23：原生扩散MPS随机数与HTTP验收
+
+扩散runner不再把seed-only请求强制成CPU generator：沿用上游runner设备，
+原生MPS张量使用MPS RNG；显式CPU噪声路径仍可使用CPU generator，已提供的
+generator状态不被重置，MLX合同不变。源码/curl安装与Formula自动打包同一
+`diffusion/worker.py`；依赖、入口和native资源无需变更，现有安装检查已要求
+PyTorch 2.13与真实MPS generator。默认随机设备改变后须重新建立seeded基线与批准。
+
+本次从干净源码清单构建后端wheel，临时非editable环境通过显式`.pth`复用
+选定0.32基础依赖，没有重装完整依赖；实际执行当前`install.sh`校验Python块
+及Formula测试Python块均通过。不是实际Homebrew重装，也未运行会切服务的
+共享准备器。全量非集成回归959项通过、6项跳过、337项排除。
+
+SeedVR2正常私有准备器已构建`b923e9a3bd43ea71`，核对完整RECORD、资源、许可证
+和依赖后，用私有CLI在独立18100端口通过默认warmup；图片与5帧派生视频均完成
+原生HTTP生成、同seed像素重复验证及服务关闭。证据在
+`outputs/seedvr2-http-full-20261023/`，这不等于ANE＋DynamicEngine已获批。
+未发布远端curl/tap，未重装Homebrew、切共享current或重启既有服务。
+
+### 有界落盘捕获与流式DynamicEngine
+
+`DiskCaptures`使用现有包内模块及标准库文件IO，不新增依赖、入口、native资源
+或模型白名单；`pyproject.toml`的包发现规则保持不变。安装器源码/curl校验和
+Formula测试块均显式导入`CaptureSession`与`DiskCaptures`，私有SeedVR2 ready
+校验也验证新接口，递归源码指纹与完整RECORD覆盖实际实现。
+
+本次临时非editable后端wheel已执行更新后的安装器/Formula Python检查、
+`pip check`和全量非集成回归：1002通过、9跳过、338排除；流式捕获及真实MPS
+内存/磁盘完整搜索等价等定向回归118项通过。临时环境通过明确`.pth`复用选定
+0.32依赖，setuptools保持vLLM要求的78.1.1；不是完整依赖重装或真实brew安装。
+默认内存捕获上限不变，磁盘路径逐样本保留完整激活；Engine实现hash变化会使
+旧批准失效，必须重新校准，不提供历史批准迁移或请求期搜索。
+
+流式SeedVR2环境`32d4415b8e04479a`的Omni构建遇到GitHub传输中断，本次未冒充
+全新Omni源码构建：复核此前同一固定commit、同一7B补丁的私有纯Pythonwheel
+整包SHA256与完整RECORD后，标准`wheel unpack/pack`更新当前随包校准器资源，
+安装到本次尚无ready的独立环境。正常准备器随后完成ready复用校验、
+完整资源/RECORD/许可证和`pip check`，ANE工具也已显式准备。
+通用后端wheel仍从当前干净源码构建；共享安装和现有服务未修改。
+完整离线来源记录在`outputs/seedvr2-stream-install-20261023/offline-wheel-source.json`，
+不把该路径记作重新下载源码、完整依赖重装或远端发布。
 
 卸载仅移除确认不再被服务使用的安装器环境或 `brew uninstall vllm-omni-metal`；不删除模型缓存、生成文件或仍被其他项目使用的 vllm-metal。

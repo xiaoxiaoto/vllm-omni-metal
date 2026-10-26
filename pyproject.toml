@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-omni-metal"
-version = "0.31.0.dev0"
+version = "0.32.0.dev0"
 description = "Apple Silicon MPS platform plugin for vLLM-Omni"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 dependencies = [
-    "vllm==0.31.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "vllm-metal==0.31.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "vllm-omni==0.31.0.dev0",
+    "vllm==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "vllm-metal==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "vllm-omni>=0.32.0.dev0",
     "torch>=2.13",
     "diffusers>=0.40,<0.41",
     "psutil>=5.9",

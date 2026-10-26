@@ -5,19 +5,25 @@
 #include <iostream>
 #include <iterator>
 int main(int argc,char** argv) {
-  if (argc!=6 && argc!=7) return 2;
+  const bool projection = argc == 8 && std::string(argv[6]) == "projection";
+  if (argc!=6 && argc!=7 && !projection) return 2;
   try {
   vpipe::AneGraphSpec s;
-  s.kind=vpipe::AneGraphSpec::Kind::SwiGluFfn;
+  s.kind=projection ? vpipe::AneGraphSpec::Kind::Matmul : vpipe::AneGraphSpec::Kind::SwiGluFfn;
   s.M=std::stoi(argv[1]);s.K=std::stoi(argv[2]);s.N=std::stoi(argv[3]);
   s.runtime_weights=argc==7;s.weights_out_in=s.runtime_weights;s.bk=s.bn=1024;
+  if (projection) {
+    s.biases=std::string(argv[7])=="bias";
+    s.bk=s.K%1024==0 ? 1024 : 0;
+    s.bn=s.N%1024==0 ? 1024 : 0;
+  }
   if (!s.valid() || s.M<1 || s.M>16384) return 2;
-  if (s.K>(256LL*1024*1024)/(6LL*s.N)) return 2;
+  const auto expected=projection ? 2ULL*s.K*s.N+(s.biases ? 2ULL*s.N : 0) : 6ULL*s.K*s.N;
+  if(expected>256ULL*1024*1024) return 2;
   if (s.runtime_weights) {
     std::string error;
     return vpipe::AneEmitter::emit(s,{},argv[5],&error) ? 0 : 1;
   }
-  const auto expected=6ULL*s.K*s.N;
   std::error_code ec;
   const auto size=std::filesystem::file_size(argv[4],ec);
   if(ec || size!=expected || size>256ULL*1024*1024) return 2;

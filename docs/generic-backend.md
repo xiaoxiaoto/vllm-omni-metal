@@ -8,6 +8,20 @@
 
 完整 generation pipeline 的 diffusion attention 使用 `MetalSDPABackend`：仅覆盖 backend/impl 的选择与 `forward` 入口，直接复用上游 `SDPAImpl._forward_impl` 的 Torch 实现，保留 BSHD 布局、mask、GQA、causal 和 scale 语义。上游默认入口只派发内置 CUDA/ROCm/NPU/XPU/MUSA 平台，因此 OOT Metal 不能直接返回原 `SDPABackend`。不修改上游类、平台枚举或模型 registry，不伪装 CUDA，也不转移张量到 CPU；Diffusers 自己的 attention 路径不受影响。
 
+### 0.32 diffusion加载回调合同
+
+`MetalDiffusionModelRunner.load_model` 接受上游0.32传入的 `initialize_lora`，
+Torch路径交由上游加载器按其原始时序决定是否调用，随后再接入量化。
+这不是新增Metal LoRA支持，原配置限制不变；自管理MLX仍自行加载权重，
+不调用PyTorch LoRA初始化回调，不经过Torch checkpoint loader。
+真实Qwen启动已复现旧签名的TypeError，修复后的微型原生MPS完整生成及MLX边界
+回归6项通过；小流水线不代表完整Qwen图片已通过。
+
+Qwen私有补丁还将模型的NPU专用SDPA实现覆写限定在NPU平台，
+避免该兄弟实现与Metal SDPA的继承合同冲突；不放宽通用Attention类型检查、
+不覆盖registry或修改已安装的上游源码。该调整归模型私有wheel，真实MPS
+attention构造及数值对照回归通过。
+
 ### 0.32 桥接与分页执行合同修复（2026-10-22）
 
 独立 YuE2 首次真实推理返回HTTP500，根因为旧
@@ -184,6 +198,35 @@ SeedVR2 vid proj_out、Qwen-Image img_mlp.out；它们的融合算路与完整�
 [本次安装验收](installation.md#2026-10-22通用-dynamicengine-接入验收)。
 真实整模型质量仍须单独批准；历史测量不是本次结果，未默认启用、切换ready／服务或发布远端。
 
+离线完整激活超过内存捕获上限时，可显式使用
+`quantization.capture.DiskCaptures`：每次完整CPU激活最多128MiB，累计原始落盘
+默认最多1GiB，逐候选私有目录必须是全新绝对路径。完整shape、原dtype和全部
+实际step保持不变，不子采样、不cast、不使用pickle。目录0700、文件0600，
+读取检查身份/权限/长度和绑定元数据的原始字节hash；清理只删除本次拥有的文件。
+
+`DynamicEngine.search`对磁盘捕获逐样本读取并释放输入/参考，沿用相同源精度、
+W4/W8、双1%误差与最小实际存储决策；仍要求至少四个不同非负step且各候选集合一致。
+捕获开始时的源指纹在搜索前后复核。原`CaptureSession`的总128MiB内存预算、
+内存捕获格式和搜索试验顺序不变。实现hash已改变，旧批准必须重新校准；
+这不是旧批准迁移、自动量化或请求期落盘/搜索入口。
+
+本次流式/捕获/SeedVR2边界及真实MPS内存-磁盘搜索等价回归118项通过，
+全量非集成1002项通过、9项跳过、338项排除；小算路通过不替代完整媒体联合批准。
+独立非editable环境的CPU落盘API烟测完成四个完整样本写入、逐样本全值读取及
+owned目录清理；累计80字节超过单样本20字节RAM限额，未使用子采样或cast。
+完整SeedVR2流式联合校准另见`outputs/seedvr2-joint-streamed-20261024/`：
+四组真实原精度图片/视频已输出，但视频重复校验期间available降至2.39GiB，
+低于4GiB门禁而中止；未进入捕获/search/ANE，完整模型联合执行仍未验证或批准。
+
+联合模式使用新增的 `ane.projection.DenseProjection`，只卸载原生 gate/up 或带bias
+proj_in；DynamicEngine down、原激活和其余pipeline仍由GPU执行。Higgs使用Talker
+四层down而保留Code2Wav实际原生精度；Qwen Image使用gate→SiLU→量化out；
+SeedVR2使用带bias proj_in→GELU(tanh)→量化proj_out。这些均留在私有部署，
+不增加共享模型名称分支、registry覆盖或量化/ANE独立批准拼接。
+必须分别通过完整最终媒体双1%、真实ANE和量化命中、相对同量化GPU基线的3%收益、
+浮点基线释放后的不可变重放、桥/引擎关闭及supervisor门禁；未批准不能设默认。
+接口、暂存发布和本次小张量证据见[单线性投影](ane.md#单线性投影与联合动态量化)。
+
 外部适配器的显式用法（`root` 与这些无梯度原始 Linear 已由加载器准备在 MPS；
 所有三项原权重均为 BF16，`proj4`／`proj8` 输入宽度为 64 的倍数）：
 
@@ -216,6 +259,48 @@ assert root.keep.weight is original_weight
 首个真实模型校准与 A/B 工具位于独立 YuE2 部署，不在通用插件内硬编码层号、
 歌词、采样或音频指标。原始浮点音频逐位一致、PCM16 一致、relative L2、SNR 与
 完整请求计时分别报告，不以算子误差或压缩字节数冒充无损／提速。
+
+### 2026-10-22：真实 DynamicEngine 搜索完成，整路候选拒绝
+
+在新私有环境 `5ec6aec8d7bd7d3c` 中实际执行
+`prepare_dynamic_quantization.py --frames 512 --candidate-layers auto`；
+沿用本地真实 YuE2-3B／YuE2-Vae、原资源配置、seed42、AR/NAR BF16 和 VAE FP32，
+ANE off。启动 available19.58GiB，监督366.80秒、returncode0，无资源／超时停止；
+最低available5.905GiB，进程树RSS最高1.805GiB。RSS不是MPS显存峰值。
+
+真实捕获四层的0/8/16/24次激活，局部固定双1%门槛的搜索结果：
+
+| NAR down层 | 选择 | W8最大relative L2 | W8最大scaled max |
+| --- | --- | --- | --- |
+| 0 | W8A16 | 0.2974% | 0.4329% |
+| 9 | W8A16 | 0.6279% | 0.6098% |
+| 18 | BF16 identity | 0.7565% | 1.0363% |
+| 27 | W8A16 | 0.4442% | 0.6211% |
+
+四层W4均被拒绝。安装hook后的float与无hook原生参考逐位一致。正式交错
+float→dynamic→dynamic→float，三项量化投影每次生成各实际调用64次、32896行，
+第18层保持原模块和权重身份。完整AR→NAR→VAE→CPU音频计时，不含加载和warmup：
+
+| 路径 | 正式样本1 s | 正式样本2 s |
+| --- | --- | --- |
+| 原精度float | 41.7593 | 41.3499 |
+| dynamic候选 | 40.2152 | 41.9528 |
+
+两路各自同seed可复现，但跨路线原始float32和PCM16均不相同：
+最终音频relative L2 **1.3409%**、scaled max **7.9338%**、max abs0.0664984、
+SNR37.452dB；没有稳定至少3%的速度收益。全部8份实际NPY/WAV均核验为
+48kHz双声道、982976样本／20.4787秒、有限非静音、幅度合法。它们是固定512帧
+预算输出，不是完整歌曲、歌词正确性或听感验收。
+
+释放浮点baseline后，原module/weight弱引用消失，benchmark持有浮点字节为0，
+再次真实生成与释放前dynamic hash一致，pending为0，engine关闭且监督完成。
+这不是独立冷启动或全模型净内存收益验证。
+
+**批准结论为false**：局部敏感度通过不能替代最终质量，且速度不满足批准条件。
+保留 `candidate-profile.json`，没有生成 `approved-profile.json`，不启动dynamic、
+不回退旧manual W8或原精度服务，不修改其他模型。证据：
+`outputs/yue2-dynamic-repair-20261022/calibration-continue-2/`；
+`verification.json` 汇总真实音频核验，`completed.json` 保存拒绝及实际释放证据。
 
 ### 2026-10-22：YuE2 混合精度真实验证启动阻塞
 
@@ -622,7 +707,12 @@ CPU wheel 的 CUDA capture 查询会抛 dummy-base 错误。`native/compat.py` �
 
 MLX facade 声明 `metal_runtime='mlx'`，自行实现无参数 `load_weights()`；通用 runner 只构造并调用一次，加载成功后发布实例，用 MLX allocator 统计权重用量。此路径不经过 PyTorch loader，不创建 Torch noise generator 或 LoRA manager。本项目不提供具体 MLX facade。
 
-外部类可以提供 `validate_metal_config(config)`，模型约束不硬编码到后端。Diffusers 使用上游 adapter、CPU noise generator 和 MPS SDPA。
+外部类可以提供 `validate_metal_config(config)`，模型约束不硬编码到后端。Diffusers 使用上游 adapter 和 MPS SDPA。Torch runner 的 seed-only 请求沿用上游设备选择，在 MPS 上创建原生 MPS generator；PyTorch 2.13 已支持该路径，不再强制 CPU generator。显式 CPU generator 仍供主动在主机创建噪声的 pipeline 使用，不自动移动噪声或重建/重置调用者已提供的 RNG 状态。只接受 cpu/mps，显式设备须与提供的 generator 匹配；MLX 自管理路径仍不创建 Torch generator。默认随机设备变化后必须重新验证历史 seeded 输出与完整量化/ANE批准，不能把旧 CPU-noise 结果当作新的基线。
+
+真实 SeedVR2 HTTP 启动已复现旧 CPU-generator/MPS 张量不匹配；修复后原生 CLI
+通过默认 warmup，并经 `/v1/images/edits` 与 `/v1/videos/sync` 完整生成与同seed复验。
+视频仅覆盖用户授权从原视频派生的512×512、5帧、24fps图形短片，不外推原长视频。
+该修复不跳过warmup、模型边界或资源门槛，不增加HTTP adapter。
 
 ## 可执行验收
 

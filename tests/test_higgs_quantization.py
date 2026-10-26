@@ -298,3 +298,165 @@ def test_release_requires_actual_baseline_weakref_expiry(adapter, monkeypatch):
     # module/weight reference survives.
     state["float"] = None
     assert worker.higgs_quant_release()["result"]["float_baseline_released"] is True
+
+
+@pytest.fixture
+def joint(adapter, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "higgs_metal_quantization", adapter)
+    spec = importlib.util.spec_from_file_location("higgs_test_joint", DEPLOY / "higgs_joint.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_joint_off_does_not_touch_talker(joint, monkeypatch):
+    monkeypatch.delenv("HIGGS_METAL_JOINT", raising=False)
+    model = torch.nn.Module()
+    joint.finish_load(model)
+    assert model._metal_quantization_metadata == {
+        "managed": True,
+        "mode": "off",
+        "approved": False,
+    }
+    assert not hasattr(model, "_higgs_joint_gates")
+
+
+def test_joint_rejects_independent_codec_approval(joint, adapter):
+    with pytest.raises(ValueError, match="complete Higgs joint"):
+        joint.approved(approval(adapter))
+
+
+def test_joint_rejects_incomplete_talker(joint):
+    with pytest.raises(ValueError, match="36-layer"):
+        joint.projections(SimpleNamespace(model=SimpleNamespace(layers=[])))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_joint_preserves_actual_codec_source_precision(adapter, monkeypatch, dtype):
+    monkeypatch.setenv("HIGGS_METAL_JOINT", "joint")
+    monkeypatch.setenv("HIGGS_METAL_QUANTIZATION", "off")
+    model = codec(dtype=dtype)
+    original, weight = model.fc2, model.fc2.weight
+    value = torch.randn(3, 64, dtype=dtype)
+    expected = original(value)
+    adapter.finish_load(model)
+    assert model.fc2 is original and model.fc2.weight is weight
+    assert model.fc2.weight.dtype == dtype
+    assert torch.equal(model.fc2(value), expected)
+    monkeypatch.setenv("HIGGS_METAL_QUANTIZATION", "dynamic")
+    with pytest.raises(ValueError, match="source identity"):
+        adapter.finish_load(model)
+    assert model.fc2 is original
+
+
+def test_joint_codec_detects_equal_value_parameter_replacement(adapter, joint, monkeypatch):
+    monkeypatch.setenv("HIGGS_METAL_JOINT_CALIBRATION", "1")
+    monkeypatch.setenv("HIGGS_METAL_QUANTIZATION", "off")
+    model = codec(dtype=torch.bfloat16)
+    adapter.finish_load(model)
+    worker = adapter.QuantizationPreparation()
+    worker.get_model = lambda: model
+    worker.model_runner = SimpleNamespace(requests={})
+    before = worker.higgs_quant_snapshot()["result"]["source_identity"]
+    joint.validate_codec_identity(before)
+    model.fc2.weight = torch.nn.Parameter(model.fc2.weight.detach().clone())
+    after = worker.higgs_quant_snapshot()["result"]["source_identity"]
+    assert after["identity"] is False
+    with pytest.raises(ValueError, match="native identity"):
+        joint.validate_codec_identity(after)
+
+
+def test_joint_count_preserves_native_tuple_and_strides(joint):
+    class Native(torch.nn.Module):
+        def forward(self, x):
+            assert not x.is_contiguous()
+            return x, None
+
+    wrapped = joint.CountProjection(Native())
+    value = torch.randn(2, 64, 7).transpose(1, 2)
+    result = wrapped(value)
+    assert result[0] is value and result[1] is None
+    assert wrapped.metrics == {"calls": 1, "rows": 14}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("ane_chunks", 0),
+        ("quantized_calls", 0),
+        ("engine_shutdown", False),
+        ("ane_relative_l2", 0.02),
+        ("ane_scaled_max_abs", float("nan")),
+    ],
+)
+def test_joint_rejects_inactive_unclosed_or_inaccurate_execution(joint, field, value):
+    # Synthetic rejection fixture only; never a publishable source-bound profile.
+    numerical = {
+        "relative_l2": 0.001,
+        "scaled_max_abs": 0.001,
+        "shape": [257, 2560],
+        "ane_chunks": 1,
+    }
+    record = {
+        "chunks": 1,
+        "baseline": [10.0, 10.1],
+        "candidate": [9.0, 9.1],
+        "numerical_check": numerical,
+    }
+    sample = {
+        "seed_repeatable": True,
+        "natural_stop": True,
+        "released_matches": True,
+        "same_shape": True,
+        "same_dtype": True,
+        "relative_l2": 0.001,
+        "scaled_max_abs": 0.001,
+        "ane_relative_l2": 0.001,
+        "ane_scaled_max_abs": 0.001,
+        "candidate_calls": 4,
+        "candidate_rows": 257,
+        "ane_chunks": 1,
+        "quantized_calls": 4,
+        "baseline_sha256": "a" * 64,
+        "candidate_sha256": "b" * 64,
+        "ane_reference_sha256": "c" * 64,
+    }
+    evidence = {
+        "policy": copy.deepcopy(joint.POLICY),
+        "float_released": True,
+        "ane_closed": True,
+        "codec_identity": {"dtype": "torch.bfloat16", "identity": True},
+        "engine_shutdown": True,
+        "supervisor_success": True,
+        "samples": [{**sample, "text": text} for text in joint.TEXTS],
+        "projections": {
+            str(i): {"identity": "a" * 64, "profiles": {"257": copy.deepcopy(record)}}
+            for i in joint.LAYERS
+        },
+    }
+    if field == "engine_shutdown":
+        evidence[field] = value
+    else:
+        evidence["samples"][0][field] = value
+    profile = {
+        "selected": list(joint.SELECTED),
+        "modules": {name: {"bits": 8} for name in joint.SELECTED},
+        "calibration": {
+            "engine": "DynamicEngine",
+            "approved": True,
+            "local_pass": True,
+            "joint": evidence,
+        },
+    }
+    import hashlib
+
+    from vllm_omni_metal.quantization.linear import _encoded
+
+    candidate = copy.deepcopy(profile)
+    del candidate["calibration"]["joint"]
+    candidate["calibration"]["approved"] = False
+    evidence["quantization_candidate_sha256"] = hashlib.sha256(_encoded(candidate)).hexdigest()
+    with pytest.raises(ValueError, match="shutdown|hit/repeat/release"):
+        joint.approved(profile)

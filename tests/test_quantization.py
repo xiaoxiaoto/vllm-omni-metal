@@ -25,6 +25,23 @@ MPS = pytest.mark.skipif(
 SCOPE = "test-pipeline-revision/seed42/complete-configuration"
 
 
+def test_bridge_path_tracks_vllm_metal_package_layout(monkeypatch, tmp_path):
+    from vllm_omni_metal.quantization import linear
+
+    package = tmp_path / "vllm_metal"
+    package.mkdir()
+    bridge = package / "tensor_bridge.py"
+    bridge.write_text("# 0.32 package layout\n")
+
+    class Distribution:
+        def locate_file(self, relative):
+            return tmp_path / relative
+
+    monkeypatch.setattr(linear.importlib.metadata, "distribution", lambda name: Distribution())
+
+    assert linear._bridge_path() == bridge
+
+
 def linear(*, dtype=torch.float16, device="cpu", bias=True, width=128, outputs=32):
     # CPU-generated source data keeps the reference independent of MPS RNG.
     generator = torch.Generator().manual_seed(872)

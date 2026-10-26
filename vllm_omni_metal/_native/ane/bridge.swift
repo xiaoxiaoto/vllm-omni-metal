@@ -87,6 +87,24 @@ public func ffnLoad(_ path:UnsafePointer<CChar>, _ rows:Int64, _ hidden:Int64) -
     } catch { fputs("CoreML load error: \(error)\n", stderr); return -1 }
 }
 
+// Separate ABI: the legacy FFN loader retains its square-output contract.
+@_cdecl("projection_load")
+public func projectionLoad(_ path:UnsafePointer<CChar>, _ rows:Int64, _ inputs:Int64, _ outputs:Int64) -> Int32 {
+    lock.lock(); defer { lock.unlock() }
+    do {
+        let session = try Session(URL(fileURLWithPath:String(cString:path)))
+        guard rows > 0, inputs > 0, outputs > 0,
+              rows <= Int64.max / inputs, rows <= Int64.max / outputs,
+              session.weights.isEmpty,
+              session.input.count == rows * inputs, session.output.count == rows * outputs,
+              nextHandle < Int32.max else { return -2 }
+        let index = nextHandle
+        nextHandle += 1
+        sessions[index] = session
+        return index
+    } catch { fputs("CoreML projection load error: \(error)\n", stderr); return -1 }
+}
+
 @_cdecl("ffn_unload")
 public func ffnUnload(_ index:Int32) {
     lock.lock(); defer { lock.unlock() }

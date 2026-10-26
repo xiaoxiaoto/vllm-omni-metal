@@ -204,6 +204,40 @@ def test_capture_four_real_steps_without_cast(adapter_module, monkeypatch):
     assert not adapter.hooks and not adapter.local
 
 
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("VLLM_OMNI_METAL_INTEGRATION") != "1" or not torch.backends.mps.is_available(),
+    reason="显式MPS/MLX验收",
+)
+def test_capture_batches_merge_all_candidates_after_full_generations(adapter_module, monkeypatch):
+    monkeypatch.setattr(adapter_module.QwenDynamicAdapter, "_scope", lambda self: "scope")
+    model = owner(count=2, device="mps")
+    adapter = adapter_module.QwenDynamicAdapter(model)
+    names = [f"transformer_blocks.{i}.img_mlp.out" for i in range(2)]
+    adapter.prepare([0, 1])
+    try:
+        for batch in range(2):
+            with torch.inference_mode():
+                for step in range(8):
+                    tensor = torch.full((2, 64), step / 8, dtype=torch.float16, device="mps")
+                    for block in model.pipeline.transformer.transformer_blocks:
+                        block.img_mlp.out(tensor)
+            result = adapter.finish_capture()
+            assert result["complete"] == (batch == 1)
+            if batch == 0:
+                assert not adapter.candidates
+                assert list(adapter.local) == [names[1]]
+        assert set(result["precisions"]) == set(names)
+        captures = result["profile"]["calibration"]["captures"]
+        assert set(captures) == set(names)
+        assert all(
+            [record["step"] for record in items] == [0, 2, 4, 6] for items in captures.values()
+        )
+        assert not adapter.local and not adapter.hooks
+    finally:
+        adapter.close()
+
+
 def test_incomplete_capture_is_not_search(adapter_module, monkeypatch):
     monkeypatch.setattr(adapter_module.QwenDynamicAdapter, "_scope", lambda self: "scope")
     adapter = adapter_module.QwenDynamicAdapter(owner())
@@ -339,3 +373,248 @@ def test_atomic_profile_publish_no_overwrite(adapter_module, tmp_path):
         adapter_module._publish_profile(path, {"winner": 3})
     assert path.read_bytes() == before
     assert list(tmp_path.iterdir()) == [path]
+
+
+def joint_calibration():
+    value = calibration()
+    value.update(
+        policy="qwen-whole-image-joint-v1",
+        ane_baseline_seconds=[10.0, 10.1],
+        ane_candidate_seconds=[9.5, 9.6],
+        ane_profiles=[{"chunks": 1}],
+        lifecycle=dict(
+            released_repeatable=True,
+            adapter_closed=True,
+            engine_closed=True,
+            supervisor_success=True,
+        ),
+    )
+    for sample in value["samples"]:
+        sample["snapshot"] = {"ane_metrics": {"ane_chunks": 8 if sample["quantized"] else 0}}
+    return value
+
+
+@pytest.mark.parametrize("failure", ["old", "hits", "speed", "lifecycle", "repeat", "error"])
+def test_joint_approval_rejects_independent_or_incomplete_evidence(adapter_module, failure):
+    value = joint_calibration()
+    adapter_module.joint_approval(value)
+    if failure == "old":
+        value["policy"] = "qwen-whole-image-dynamic-v1"
+    elif failure == "hits":
+        value["samples"][1]["snapshot"]["ane_metrics"]["ane_chunks"] = 0
+    elif failure == "speed":
+        value["ane_candidate_seconds"] = [9.7, 9.71]
+    elif failure == "lifecycle":
+        value["lifecycle"]["supervisor_success"] = False
+    elif failure == "repeat":
+        value["samples"][2]["sha256"] = "c" * 64
+    else:
+        value["errors"][0]["scaled_max_abs"] = 0.01001
+    with pytest.raises(ValueError):
+        adapter_module.joint_approval(value)
+
+
+def test_joint_production_consumes_complete_scope_and_rejects_before_install(
+    adapter_module, monkeypatch
+):
+    monkeypatch.setenv("QWEN_IMAGE_METAL_QUANTIZATION", "joint")
+    monkeypatch.setenv("QWEN_IMAGE_METAL_QUANTIZATION_PROFILE", "/joint.json")
+    monkeypatch.setattr(adapter_module.QwenDynamicAdapter, "_scope", lambda self: "joint-scope")
+    installed = []
+    monkeypatch.setattr(
+        adapter_module.QwenDynamicAdapter, "_install", lambda *a, **k: installed.append(True)
+    )
+    value = joint_calibration()
+    value["lifecycle"]["engine_closed"] = False
+
+    def load(path, *, scope):
+        assert path == "/joint.json" and scope == "joint-scope"
+        return {"calibration": value}
+
+    monkeypatch.setattr(adapter_module, "load_profile", load)
+    model = owner()
+    original = model.pipeline.transformer.transformer_blocks[0].img_mlp.out
+    with pytest.raises(ValueError, match="关闭"):
+        adapter_module.QwenDynamicAdapter(model)
+    assert not installed
+    assert model.pipeline.transformer.transformer_blocks[0].img_mlp.out is original
+
+
+@pytest.fixture
+def joint_module():
+    spec = importlib.util.spec_from_file_location(
+        "qwen_joint_contract", DEPLOY / "joint_adapter.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_gate_executes_native_preserves_bias_and_rejects_fallback(joint_module, monkeypatch):
+    class Projection:
+        disabled = _closed = False
+        _bridge = object()
+
+        def __init__(self, weight, bias, **kwargs):
+            self.metrics = {}
+            self.closed = False
+
+        def __call__(self, hidden, *, native, context):
+            return native(hidden)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(joint_module, "prepare_projection", lambda *a, **k: None)
+    monkeypatch.setattr(joint_module, "DenseProjection", Projection)
+    source = torch.nn.Linear(4, 3)
+    hidden = torch.randn(2, 5, 4)
+    gate = joint_module.GateProjection(source, scope="scope", prepare=True)
+    torch.testing.assert_close(gate(hidden), source(hidden), rtol=0, atol=0)
+    assert gate.shapes == {(10, None)}
+    gate.chunks = 1
+    with pytest.raises(RuntimeError, match="silent GPU fallback"):
+        gate(hidden)
+    gate.chunks = 0
+    gate.return_bias = True
+    gate.skip_bias_add = True
+    source.forward = lambda x: (torch.nn.functional.linear(x, source.weight), source.bias)
+    output, bias = gate(hidden)
+    torch.testing.assert_close(output, torch.nn.functional.linear(hidden, source.weight))
+    assert bias is source.bias
+
+
+def test_gate_close_on_unhealthy_projection(joint_module, monkeypatch):
+    closed = []
+
+    class Projection:
+        disabled = True
+        _closed = False
+        _bridge = None
+
+        def __init__(self, *a, **k):
+            pass
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(joint_module, "DenseProjection", Projection)
+    with pytest.raises(RuntimeError, match="healthy"):
+        joint_module.GateProjection(torch.nn.Linear(4, 3), scope="scope", prepare=False)
+    assert closed == [True]
+
+
+def test_joint_gate_policy_consumption_rejects_shape_scope_and_chunk_drift(joint_module):
+    projection = SimpleNamespace(identity="graph-id", profiles={(512, 7): 1})
+    gate = SimpleNamespace(scope="scope:gate:0", projection=projection)
+    group = joint_module.ProjectionGroup.__new__(joint_module.ProjectionGroup)
+    group.gates = [gate]
+    record = dict(gate_scope=gate.scope, identity="graph-id", rows=512, context=7, chunks=1)
+    group.validate_records([record])
+    for key, wrong in (
+        ("gate_scope", "other"),
+        ("identity", "other"),
+        ("rows", 768),
+        ("context", 8),
+        ("chunks", 2),
+    ):
+        with pytest.raises(ValueError, match="policy"):
+            group.validate_records([{**record, key: wrong}])
+    with pytest.raises(ValueError, match="every"):
+        group.validate_records([])
+
+
+def test_gate_group_preparation_failure_rolls_back_and_closes(joint_module, monkeypatch):
+    model = owner(count=2)
+    blocks = model.pipeline.transformer.transformer_blocks
+    sources = [torch.nn.Linear(4, 3) for _ in blocks]
+    for block, source in zip(blocks, sources, strict=True):
+        block.img_mlp.gate_layer = source
+    projections = []
+
+    class Projection:
+        disabled = _closed = False
+        _bridge = object()
+
+        def __init__(self, *a, **k):
+            self.closed = False
+            projections.append(self)
+            if len(projections) == 2:
+                raise RuntimeError("load failed")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(joint_module, "DenseProjection", Projection)
+    with pytest.raises(RuntimeError, match="load failed"):
+        joint_module.ProjectionGroup(blocks, [0, 1], scope="scope", prepare=False)
+    assert all(
+        block.img_mlp.gate_layer is source for block, source in zip(blocks, sources, strict=True)
+    )
+    assert projections[0].closed
+
+
+def test_joint_profiles_are_staged_and_replayed_without_publication(joint_module, monkeypatch):
+    source = torch.nn.Linear(4, 3)
+    old = SimpleNamespace(
+        identity="graph", _bridge=SimpleNamespace(device="device"), close=lambda: None
+    )
+    gate = SimpleNamespace(
+        scope="scope:gate:0", source=source, skip_bias_add=False, projection=old, shapes={(512, 7)}
+    )
+    group = joint_module.ProjectionGroup.__new__(joint_module.ProjectionGroup)
+    group.gates = [gate]
+    calls = []
+
+    def stage(projection, rows, baseline, candidates, *, context, publish):
+        assert projection is old and rows == 512 and context == 7
+        assert publish is False
+        calls.append("staged")
+        return {"chunks": 1}
+
+    class Replay:
+        disabled = _closed = False
+        _bridge = object()
+
+        def __init__(self, weight, bias, *, scope, precision, _staged_policy):
+            assert weight is source.weight and bias is source.bias
+            assert scope == gate.scope and precision == "fp16"
+            assert _staged_policy["group"] == "graph"
+            assert list(_staged_policy["profiles"].values()) == [{"chunks": 1}]
+            calls.append("replayed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(joint_module, "publish_projection_profile", stage)
+    monkeypatch.setattr(joint_module, "DenseProjection", Replay)
+    records = group.approve([10, 10], {1: [9, 9]})
+    assert records[0]["staged_policy"]["group"] == "graph"
+    group.production()
+    assert calls == ["staged", "replayed"]
+    assert group._benchmark is False and gate.chunks is None
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("VLLM_OMNI_METAL_INTEGRATION") != "1" or not torch.backends.mps.is_available(),
+    reason="requires explicit real MPS execution",
+)
+def test_private_attention_uses_selected_metal_backend(single_rank_parallel):
+    pytest.importorskip("vllm_omni.diffusion.models.qwen_image_21.metal_adapter")
+    from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
+        QwenImage21Attention,
+    )
+
+    generator = torch.Generator().manual_seed(1729)
+    with torch.inference_mode():
+        layer = QwenImage21Attention(dim=64, heads=1, dim_head=64)
+        q, k, v = [torch.randn(1, 3, 1, 64, generator=generator).to("mps") for _ in range(3)]
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            scale=0.125,
+        ).transpose(1, 2)
+        actual = layer.attn(q, k, v)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)

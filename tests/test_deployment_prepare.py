@@ -101,6 +101,8 @@ def backend(monkeypatch, tmp_path):
             "quantization/capture.py": "CaptureSession = object\n",
             "quantization/adapter.py": "DenseModelAdapter = object\n",
             "quantization/runtime.py": "load_profile = object\nconfigure_model_quantization = object\n",
+            "ane/__init__.py": "",
+            "ane/projection.py": "DenseProjection = object\nprepare_projection = object\n",
             "_native/metal/header.h": "header",
             "_native/pytorch_backend/mps_ops.mm": "launcher",
             "_native/ane/bridge.swift": "bridge",
@@ -408,6 +410,35 @@ def test_overlay_explicit_backend_wheel_is_private_and_remembered(overlay, monke
     wheel.write_bytes(b"new wheel boundary fixture")
     assert module.prepare() != first
     assert (package / "quantization/linear.py").read_bytes() == original
+
+
+def test_overlay_migrates_flat_base_without_importing_new_api_there(overlay, monkeypatch, tmp_path):
+    module, package = overlay
+    legacy = package / "ane.py"
+    legacy.write_text("DenseSwiGLU = object\n")
+    wheel = tmp_path / "vllm_omni_metal-0.31.0.dev0-py3-none-any.whl"
+    wheel.write_bytes(b"private backend upgrade boundary fixture")
+    monkeypatch.setenv("VLLM_OMNI_METAL_WHEEL", str(wheel))
+    original_run = module.run
+
+    def run(*command, **kwargs):
+        if Path(command[0]) == Path(sys.executable) and "-c" in command:
+            arguments = list(command)
+            index = arguments.index("-c") + 1
+            arguments[index] = (
+                f"import sys; sys.path.insert(0, {str(package.parent)!r}); " + arguments[index]
+            )
+            subprocess.run(arguments, check=True, capture_output=True, text=True)
+        else:
+            original_run(*command, **kwargs)
+
+    monkeypatch.setattr(module, "run", run)
+    runtime = module.prepare()
+    assert (runtime / ".ready").read_text() == runtime.name
+    assert legacy.read_text() == "DenseSwiGLU = object\n"
+    assert (
+        Path.home() / "Library/Application Support/yue2-3b/backend-wheel"
+    ).read_text().strip() == str(wheel)
 
 
 def test_overlay_missing_selected_wheel_cannot_fall_back_to_shared_backend(

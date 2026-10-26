@@ -37,10 +37,19 @@ class MetalDiffusionWorker(DiffusionWorker):
 
 class MetalDiffusionModelRunner(DiffusionModelRunner):
     def load_model(
-        self, memory_pool_context_fn=None, load_format="default", custom_pipeline_name=None
+        self,
+        memory_pool_context_fn=None,
+        load_format="default",
+        custom_pipeline_name=None,
+        initialize_lora=None,
     ):
         if pipeline_runtime(self.od_config) == "torch":
-            result = super().load_model(memory_pool_context_fn, load_format, custom_pipeline_name)
+            result = super().load_model(
+                memory_pool_context_fn=memory_pool_context_fn,
+                load_format=load_format,
+                custom_pipeline_name=custom_pipeline_name,
+                initialize_lora=initialize_lora,
+            )
             configure_model_quantization(self.pipeline, self.od_config, runtime="torch")
             return result
         if load_format == "dummy":
@@ -68,10 +77,15 @@ class MetalDiffusionModelRunner(DiffusionModelRunner):
                     "MLX pipelines use seed, not a torch.Generator or PyTorch LoRA request."
                 )
             return
-        # MPS has no torch.Generator; Torch pipelines create noise on CPU then copy it.
-        if sampling_params.generator_device not in (None, "cpu"):
-            raise ValueError("Metal Torch pipelines require generator_device='cpu'.")
-        if sampling_params.generator is not None and sampling_params.generator.device.type != "cpu":
-            raise ValueError("Metal Torch pipelines require a CPU torch.Generator.")
-        sampling_params.generator_device = "cpu"
+        # Native MPS noise must use the runner device; explicit CPU generators
+        # remain available to pipelines that deliberately generate host noise.
+        device = sampling_params.generator_device
+        if device not in (None, "cpu", "mps"):
+            raise ValueError("Metal Torch pipelines support generator_device='cpu' or 'mps'.")
+        generator = sampling_params.generator
+        if generator is not None:
+            if generator.device.type not in ("cpu", "mps"):
+                raise ValueError("Metal Torch pipelines require a CPU or MPS torch.Generator.")
+            if device is not None and generator.device.type != device:
+                raise ValueError("generator_device must match the supplied torch.Generator.")
         super()._initialize_generator(sampling_params)

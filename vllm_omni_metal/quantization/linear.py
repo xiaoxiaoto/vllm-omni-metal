@@ -210,6 +210,14 @@ def _descriptor(linear, bits):
     return {**descriptor, "sha256": digest.hexdigest()}
 
 
+def _bridge_path():
+    distribution = importlib.metadata.distribution("vllm-metal")
+    path = Path(distribution.locate_file("vllm_metal/tensor_bridge.py"))
+    if path.is_file():
+        return path
+    raise FileNotFoundError("vllm-metal installation is missing tensor_bridge.py")
+
+
 def _environment():
     packages = {}
     for name in ("mlx", "vllm-metal", "vllm-omni-metal"):
@@ -218,11 +226,7 @@ def _environment():
             "version": str(distribution.version),
             "path": str(Path(distribution.locate_file("")).resolve()),
         }
-    bridge = Path(
-        importlib.metadata.distribution("vllm-metal").locate_file(
-            "vllm_metal/tensor_bridge.py"
-        )
-    )
+    bridge = _bridge_path()
     device = {}
     if torch.backends.mps.is_available():
         import mlx.core as mx

@@ -174,7 +174,8 @@ def test_memory_is_clamped(monkeypatch):
     assert MetalOmniPlatform.get_device_memory() == (0, 100)
 
 
-def test_seeded_noise_uses_cpu():
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Requires native MPS RNG")
+def test_native_mps_noise_repeats_seed_without_resetting_supplied_generator():
     runner = object.__new__(MetalDiffusionModelRunner)
     runner.od_config = make_config()
     runner.device = torch.device("mps")
@@ -182,16 +183,34 @@ def test_seeded_noise_uses_cpu():
     second = OmniDiffusionSamplingParams(seed=42)
     runner._initialize_generator(first)
     runner._initialize_generator(second)
-    assert first.generator_device == "cpu"
-    assert first.generator.device.type == "cpu"
-    assert torch.equal(
-        torch.randn(8, generator=first.generator), torch.randn(8, generator=second.generator)
-    )
+    noise = torch.randn(32, device="mps", generator=first.generator)
+    repeat = torch.randn(32, device="mps", generator=second.generator)
+    assert torch.equal(noise, repeat)
+    assert not torch.equal(noise, torch.randn(32, device="mps", generator=first.generator))
+    state = second.generator.get_state().clone()
+    supplied = OmniDiffusionSamplingParams(seed=999, generator=second.generator)
+    runner._initialize_generator(supplied)
+    assert torch.equal(state, supplied.generator.get_state())
+
+
+def test_explicit_cpu_noise_preserves_generator_state_and_rejects_device_mismatch():
+    runner = object.__new__(MetalDiffusionModelRunner)
+    runner.od_config = make_config()
+    runner.device = torch.device("mps")
     supplied = torch.Generator().manual_seed(7)
-    params = OmniDiffusionSamplingParams(generator=supplied)
+    expected = torch.Generator().manual_seed(7)
+    torch.randn(8, generator=supplied)
+    torch.randn(8, generator=expected)
+    params = OmniDiffusionSamplingParams(generator=supplied, generator_device="cpu")
     runner._initialize_generator(params)
-    assert params.generator is supplied
-    with pytest.raises(ValueError, match="cpu"):
+    assert torch.equal(
+        torch.randn(8, generator=params.generator), torch.randn(8, generator=expected)
+    )
+    with pytest.raises(ValueError, match="match"):
+        runner._initialize_generator(
+            OmniDiffusionSamplingParams(generator=supplied, generator_device="mps")
+        )
+    with pytest.raises(ValueError, match="cpu.*mps"):
         runner._initialize_generator(OmniDiffusionSamplingParams(seed=1, generator_device="cuda"))
 
 

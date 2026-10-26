@@ -135,7 +135,7 @@ AneGraphSpec::valid() const
   // [out,in] is a property of an INPUT; a constant's layout belongs to
   // CoreML, and its blob carries [in,out] tiles.
   if (weights_out_in && !runtime_weights) { return false; }
-  if (biases && (!runtime_weights || kind == Kind::Matmul)) {
+  if (biases && (kind == Kind::Matmul ? runtime_weights : !runtime_weights)) {
     return false;
   }
   return true;
@@ -172,6 +172,7 @@ AneEmitter::weight_slabs(const AneGraphSpec& s)
   };
   if (s.kind == AneGraphSpec::Kind::Matmul) {
     push_tiles(s.K, s.N);
+    if (s.biases) { out.push_back((std::size_t)s.N * 2); }
   } else if (s.kind == AneGraphSpec::Kind::GeluFfn) {
     push_tiles(s.K, s.N);   // up
     push_tiles(s.N, s.K);   // down
@@ -366,7 +367,16 @@ AneEmitter::emit_mil_(const AneGraphSpec& s)
 
   std::string last;
   if (s.kind == AneGraphSpec::Kind::Matmul) {
-    last = tiled("x", s.K, s.N, "", "out");
+    last = tiled("x", s.K, s.N, "", s.biases ? "projected" : "out");
+    if (s.biases) {
+      o << "            tensor<fp16, [1, " << s.N
+        << "]> bias = const()[name = string(\"bias\"), val = tensor<fp16, [1, "
+        << s.N << "]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64("
+        << blob_off << ")))];\n"
+        << "            tensor<fp16, [" << s.M << ", " << s.N
+        << "]> out = add(x = projected, y = bias)[name = string(\"out\")];\n";
+      last = "out";
+    }
   } else if (s.kind == AneGraphSpec::Kind::GeluFfn) {
     std::string u = tiled("x", s.K, s.N, "u", "uout");
     if (s.biases) {

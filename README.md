@@ -50,7 +50,7 @@ FP16/BF16 保留源 dtype，FP32 只支持 identity；不隐式 cast。
 
 ## 通用算子优化
 
-原生 attention 复用 GitHub 已发布的 [vllm-metal v0.31.0](https://github.com/vllm-project/vllm-metal/releases/tag/v0.31.0) `reshape_and_cache` / `paged_attention_primitive`，不另写 Metal kernel、不升级依赖。通过上游 DLPack bridge 共享 Torch KV，直接读取物理分页，避免历史 KV gather 与 GQA 复制；选择条件只有设备、dtype、head/block size 和布局，没有模型名分支。
+原生 attention 复用 GitHub 已发布的 [vllm-metal v0.32.0](https://github.com/vllm-project/vllm-metal/releases/tag/v0.32.0) `reshape_and_cache` / `paged_attention_primitive`，不另写 Metal kernel；核心升级仅为兼容 vLLM 0.32 的必要配套，不改变本插件算子实现。通过上游 DLPack bridge 共享 Torch KV，直接读取物理分页，避免历史 KV gather 与 GQA 复制；选择条件只有设备、dtype、head/block size 和布局，没有模型名分支。
 
 优化域为 FP32/FP16/BF16、head size 64/96/128/256/512、block size 8/16/32，以及连续 NHD 页内布局；其他已支持形状保留原有 MPS SDPA，不自动转 CPU。覆盖 prefill/decode、sliding window、MHA/GQA/MQA、strided KV offset 和请求隔离。默认 wheel 的 MLX bridge 有跨框架同步开销；下述可选 Torch-stream launcher 消除 attention 的桥接。FP32 同样可使用显式构建的 Torch-stream launcher（prefill 复用分页 kernel，不使用 half-only tiled shader），详见 [协议与来源](docs/generic-backend.md#已发布算子来源与验证)。
 
@@ -81,6 +81,17 @@ Apple M4 Pro、BF16、4×4096、30 次同步计时：普通 RMSNorm 0.182 → 0.
 M4 Pro、BF16、32×8192、30 次同步中位数：原生 0.343 → 编译路径 0.170 ms（约 **2.0×**），包含 OOT dispatch、桥接和同步。小块桥接收益不稳定，因此不默认优化小 decode。随机大 MLP Llama/Qwen3 已确认真实 worker 命中新路径、greedy 与 seed 回归通过；这仍不是整模型吞吐结果。可选缓存表 NeoX RoPE 的 vpipe 移植及限制见下节；隔离算子验证不等于默认 worker 已启用。
 
 GPU + ANE 合作提供独立、通用的 dense SwiGLU contract；默认 auto 只消费绑定源码/设备/权重/完整 pipeline 配置的离线校准，缺少匹配准备产物即保留 GPU，不在 worker/request 编译。FP16 math 必须由外部模型适配器显式选择，不是 BF16 等价替代；本插件不接管模型 registry 或捆绑 YuE2 实现。本次真实 YuE2 图自检因 relative L2 5.50% 超过1%门槛被拒绝，没有可用的本次 ANE 加速结论。准备与误差限制见 [GPU + ANE 协议](docs/ane.md)。
+
+联合量化另提供单投影 `ane.projection.DenseProjection`：支持非方阵、bias 和显式
+FP16 ANE 近似，保留原生 gate/up 与 DynamicEngine down 的独立执行，不持有已量化
+down 的浮点回退。真实 NE 数值烟测不等于模型批准；Higgs、Qwen Image、SeedVR2
+必须分别完成整任务质量、实际双路径命中、相对同量化 GPU 基线的3%收益及释放重放，
+不能拼接两份独立批准或只改 flags 设默认。详见[联合投影合同](docs/ane.md#单线性投影与联合动态量化)。
+
+单投影离线校准可通过 `set_benchmark_chunks("auto")` 使用 vpipe 式预测分配：
+按同步实测的 GPU 秒/行与 ANE 秒/块更新速率，枚举合法 split，仅预测改善超过5%
+才调整。`finish_audit()` 冻结最后实际审核过的分配；生产不在线改变已批准策略。
+这不解除256行分块限制，也不替代完整任务的1%质量及3%收益门槛。
 
 第四阶段提供可选 **纯 Torch-stream paged attention**：复用已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的 host launcher 和已安装的 0.31 shader。固定 wheel 缺少该 launcher，因此需在选定环境中显式编译一次（Apple Command Line Tools）；host adapter 仅补齐已发布 FP32 shader 的 dtype/路由选择，不升级依赖、不写 attention shader、不修改上游安装，运行时不自动编译。
 
@@ -113,17 +124,23 @@ M4 Pro / BF16：缓存 RoPE（4 rows、hidden 4096、Q/KV heads32/8、head128）
 
 | 项目 | 安装版本 |
 | --- | --- |
-| vLLM | 最新稳定 `0.31.0+cpu`，官方 macOS arm64 wheel |
-| vllm-metal | 最新稳定 `0.31.0`，官方 macOS arm64 wheel |
-| vLLM-Omni | main `2ec5f265c69520cdd5e5f0a19db485d38885843e`，标记 `0.31.0.dev0+cpu` |
-| vllm-omni-metal | `0.31.0.dev0`，与固定 Omni 的公开版本一致（不含 `+cpu` 构建标记） |
-| PyTorch / Transformers | 本次完整安装为 `2.13.0` / `5.14.1` |
+| vLLM | `0.32.0+cpu`，官方 macOS arm64 cp38-abi3 wheel |
+| vllm-metal | `0.32.0`，官方 macOS 15+ arm64 wheel |
+| vLLM-Omni | 官方 main `d6db19b41f8c081506468859cd8f3910f77f1e5c`，开发版 `0.32.0.dev0+cpu` |
+| vllm-omni-metal | `0.32.0.dev0`，与 Omni 开发版公开版本一致（不含 `+cpu` 构建标记） |
+| Transformers | 由 vLLM 0.32 解析至 `>=5.16.1,<5.20.0` |
 
-Omni 最新稳定 tag 仍为 0.30；需要 YuE2 等新集成时使用上述固定 main 快照，不能与 0.30 vLLM wheel 混装。native wheel 固定 SHA256，Omni 固定 commit，不在每次启动时自动追踪最新依赖，不下载模型。无需编译本项目或 vllm-metal 的原生 kernel。
+Omni 开发版号允许本地 `+cpu` 构建标签；插件依赖保留 `>=0.32.0.dev0`，不限制本地构建标签。Omni `+cpu` 与 Metal 插件开发版号明确标记为开发快照，不冒充稳定发布版。
 
-当前源码安装已在新的独立环境实际解析依赖并显式准备 Torch-stream launcher；源码与 wheel 隔离烟测、回归结果及未验证入口见[安装说明](docs/installation.md)。真实 YuE2 生成依赖独立模型 overlay，不等于未补丁 Omni 开箱支持；此前的随机模型集成结果不替代本次安装验证。
+### 源码安装
 
-### 源码安装（当前 checkout 可用）
+```bash
+cd /path/to/vllm-omni-metal
+./install.sh
+source .venv-vllm-omni-metal/bin/activate
+vllm-omni --help
+```
+
 
 ```bash
 cd /path/to/vllm-omni-metal  # 包含本次新增 install.sh 的 checkout
@@ -138,7 +155,7 @@ vllm-omni --help
 
 ### Homebrew 与 curl
 
-已提供 `Formula/vllm-omni-metal.rb` 和支持 `curl | bash` 的安装器。**本次 0.31 升级尚未发布到远端，远端 tap/curl 不会自动包含本地改动**；发布 Formula、安装器和插件源码后：
+本地 `Formula/vllm-omni-metal.rb` 与源码/curl 安装器已固定 vLLM / Metal 0.32、Omni `0.32.0.dev0+cpu` 和插件 `0.32.0.dev0`。本次未完成全依赖重新安装或远端发布；下列远端命令仅在配套资源发布后使用，不能把本地 wheel 烟测当作新安装入口端到端通过。
 
 ```bash
 brew tap xiaoxiaoto/vllm-omni-metal https://github.com/xiaoxiaoto/vllm-omni-metal

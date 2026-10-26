@@ -4,8 +4,7 @@ require "uri"
 class VllmOmniMetal < Formula
   desc "Native multi-stage vLLM-Omni inference on Apple Silicon"
   homepage "https://github.com/xiaoxiaoto/vllm-omni-metal"
-  # No published plugin release matches the 0.31 stack yet; install HEAD.
-  license "Apache-2.0"
+  # Core wheels and the pinned Omni development snapshot use the 0.32 compatibility group.
   head "https://github.com/xiaoxiaoto/vllm-omni-metal.git", branch: "main"
 
   depends_on arch: :arm64
@@ -16,15 +15,15 @@ class VllmOmniMetal < Formula
   preserve_rpath
 
   resource "vllm" do
-    url "https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl",
+    url "https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl",
         using: :nounzip
-    sha256 "21378516a51ff15029f71168e827b94660e21b39484eb52277166f01ac7dd686"
+    sha256 "c28cf0fede58f02c4886d2794217ec3c7e4bbd22dfeb16b4b32586a8f230bb75"
   end
 
   resource "vllm-metal" do
-    url "https://github.com/vllm-project/vllm-metal/releases/download/v0.31.0/vllm_metal-0.31.0-cp312-cp312-macosx_15_0_arm64.whl",
+    url "https://github.com/vllm-project/vllm-metal/releases/download/v0.32.0/vllm_metal-0.32.0-cp312-cp312-macosx_15_0_arm64.whl",
         using: :nounzip
-    sha256 "e2ab31296f8c42d8b65c8d5f5490f160087d1070178444870a5672e44aaacf6e"
+    sha256 "458d34157eb02a6bfb0e293c70485df18f72b7eb1d1ce8f1eefea95ba47ab63c"
   end
 
   def install
@@ -35,9 +34,9 @@ class VllmOmniMetal < Formula
       cp resource(name).cached_download, wheel
       wheel
     end
-    with_env(VLLM_OMNI_TARGET_DEVICE: "cpu", VLLM_OMNI_VERSION_OVERRIDE: "0.31.0.dev0+cpu") do
-      system libexec/"bin/pip", "install", *wheels,
-             "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@2ec5f265c69520cdd5e5f0a19db485d38885843e",
+    with_env(VLLM_OMNI_TARGET_DEVICE: "cpu", VLLM_OMNI_VERSION_OVERRIDE: "0.32.0.dev0+cpu") do
+      system libexec/"bin/pip", "install", "--no-cache-dir", *wheels,
+             "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@d6db19b41f8c081506468859cd8f3910f77f1e5c",
              buildpath
     end
     system libexec/"bin/pip", "check"
@@ -96,6 +95,7 @@ class VllmOmniMetal < Formula
       import torch
       from vllm_omni_metal import is_available
       from vllm_omni_metal.ane.runtime import DenseSwiGLU, TiledDenseSwiGLU, execution_scope
+      from vllm_omni_metal.quantization.capture import CaptureSession, DiskCaptures
       from importlib.resources import files
       import sys
       from pathlib import Path
@@ -108,7 +108,7 @@ class VllmOmniMetal < Formula
                      'ops.normalization', 'ops.activation', 'ops.rotary',
                      'quantization.linear', 'quantization.engine',
                      'quantization.capture', 'quantization.adapter', 'quantization.runtime',
-                     'ane.cache', 'ane.runtime', 'ane.build'):
+                     'ane.cache', 'ane.runtime', 'ane.build', 'ane.projection', 'ane.allocation'):
           import_module(f'vllm_omni_metal.{module}')
       # CPU-only mixed-precision profile contract (no packing or model execution).
       from vllm_omni_metal.quantization.linear import build_profile, validate_profile
@@ -155,9 +155,9 @@ class VllmOmniMetal < Formula
           '_native/ane/LICENSE',
       ):
           assert files('vllm_omni_metal').joinpath(resource).is_file(), resource
-      assert version('vllm') == '0.31.0+cpu'
-      assert version('vllm-metal') == '0.31.0'
-      assert version('vllm-omni') == '0.31.0.dev0+cpu'
+      assert version('vllm') == '0.32.0+cpu'
+      assert version('vllm-metal') == '0.32.0'
+      assert version('vllm-omni') == '0.32.0.dev0+cpu'
       assert version('vllm-omni-metal') == version('vllm-omni').split('+', 1)[0]
       assert is_available()
       assert torch.Generator(device='mps') is not None
@@ -167,6 +167,7 @@ class VllmOmniMetal < Formula
     system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ops.mps_attention", "--help"
     system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ops.vpipe_kernels", "--help"
     system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ane.build", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ane.projection", "--help"
     system libexec/"bin/python", "-I", bin/"vllm-omni", "--help"
   end
 end

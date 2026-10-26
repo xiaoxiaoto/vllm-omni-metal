@@ -189,31 +189,8 @@ def test_global_fallback_uses_scoped_loader(adapter, monkeypatch, tmp_path):
     assert graph._metal_quantization_metadata["approved"] is False
 
 
-def test_approved_private_consumer_marks_root_with_actual_profile(adapter, monkeypatch):
-    from vllm_omni_metal.quantization import runtime
-
-    graph = SmallGraph()
-    profile = profile_for(adapter, graph)
-    monkeypatch.setenv("SEEDVR2_METAL_QUANTIZATION", "dynamic")
-    monkeypatch.setenv("SEEDVR2_METAL_QUANTIZATION_PROFILE", "private.json")
-    monkeypatch.setenv("VLLM_OMNI_METAL_QUANTIZATION_PROFILE", "global.json")
-    monkeypatch.setattr(adapter, "scope", lambda graph: "behavior-only")
-    loaded = []
-
-    def load(path, *, scope):
-        loaded.append((path, scope))
-        return profile
-
-    monkeypatch.setattr(runtime, "load_profile", load)
-    monkeypatch.setattr(adapter, "apply", lambda graph, data, *, bound_scope: {})
-    adapter.consume_profile(graph)
-    assert loaded == [("private.json", "behavior-only")]
-    assert graph._metal_quantization_metadata["managed"] is True
-    assert graph._metal_quantization_metadata["approved"] is True
-    assert graph._metal_quantization_metadata["profile"] is profile
-
-
-def test_local_engine_search_is_not_model_approval(adapter):
+def test_local_engine_search_is_not_model_approval(adapter, monkeypatch):
+    monkeypatch.setattr(generic, "_environment", lambda: {})
     graph = SmallGraph()
     profile = profile_for(adapter, graph)
     profile["calibration"]["approved"] = False
@@ -453,6 +430,106 @@ def test_atomic_approval_publication_never_replaces_existing(calibration, tmp_pa
     os.environ.get("VLLM_OMNI_METAL_INTEGRATION") != "1" or not torch.backends.mps.is_available(),
     reason="需要显式真实 MPS 集成测试",
 )
+def test_disk_candidate_four_workloads_release_complete_inputs(calibration, tmp_path):
+    module = (
+        torch.nn.Linear(128, 64, dtype=torch.float16, device="mps").eval().requires_grad_(False)
+    )
+    workloads = [(kind, seed) for kind in ("image", "video") for seed in (7723, 7724)]
+    baseline = {}
+    references = []
+    calls = []
+
+    def run(workload, label):
+        # A new full input per workload, including a second projection call that
+        # must not be captured. Weakrefs detect accidental retention by hooks/store.
+        assert all(reference() is None for reference in references)
+        activation = torch.full(
+            (2, 128), float(workloads.index(workload) + 1), dtype=torch.float16, device="mps"
+        )
+        references.append(weakref.ref(activation))
+        with torch.inference_mode():
+            output = module(activation).cpu().numpy()
+            module(activation + 1)
+        calls.append(workload)
+        return output, {}
+
+    for workload in workloads:
+        baseline[workload] = run(workload, "baseline")[0]
+    calls.clear()
+    result = calibration.capture_candidate(
+        "projection",
+        module,
+        workloads,
+        run,
+        baseline,
+        tmp_path / "capture-0",
+        label="capture",
+        scope="behavior-only",
+    )
+    assert calls == workloads
+    assert all(reference() is None for reference in references)
+    assert not module._forward_pre_hooks
+    assert not (tmp_path / "capture-0").exists()
+    assert (tmp_path / "capture-0.json").is_file()
+    assert [
+        entry["step"] for entry in result["profile"]["calibration"]["captures"]["projection"]
+    ] == list(range(4))
+    assert module.weight.dtype == torch.float16
+
+
+@pytest.mark.parametrize("failure", ["record", "search"])
+def test_disk_candidate_failures_close_hook_and_store(calibration, tmp_path, monkeypatch, failure):
+    from vllm_omni_metal.quantization.capture import DiskCaptures
+
+    module = torch.nn.Linear(128, 64, dtype=torch.float16).eval().requires_grad_(False)
+    workloads = [("image", 7723), ("image", 7724), ("video", 7723), ("video", 7724)]
+    baseline = {}
+
+    def run(workload, label):
+        with torch.inference_mode():
+            output = module(torch.ones(2, 128, dtype=torch.float16)).numpy()
+        return output, {}
+
+    for workload in workloads:
+        baseline[workload] = run(workload, "baseline")[0]
+    if failure == "record":
+        original_record = DiskCaptures.record
+
+        def fail_record(self, name, step, tensor):
+            original_record(self, name, step, tensor)
+            if step == 1:
+                raise RuntimeError("record failure")
+
+        monkeypatch.setattr(DiskCaptures, "record", fail_record)
+    else:
+
+        def fail_search(modules, captures, *, scope):
+            assert captures.steps("projection") == [0, 1, 2, 3]
+            assert not module._forward_pre_hooks
+            raise RuntimeError("search failure")
+
+        monkeypatch.setattr(DynamicEngine, "search", fail_search)
+    with pytest.raises(RuntimeError, match=f"{failure} failure"):
+        calibration.capture_candidate(
+            "projection",
+            module,
+            workloads,
+            run,
+            baseline,
+            tmp_path / "capture-0",
+            label="capture",
+            scope="behavior-only",
+        )
+    assert not module._forward_pre_hooks
+    assert not (tmp_path / "capture-0").exists()
+    assert (tmp_path / "capture-0.json").is_file()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("VLLM_OMNI_METAL_INTEGRATION") != "1" or not torch.backends.mps.is_available(),
+    reason="需要显式真实 MPS 集成测试",
+)
 def test_real_dynamic_engine_search_preserves_seedvr2_source_fp16(adapter):
     graph = SmallGraph("mps").eval()
     name = adapter.CANDIDATES[0]
@@ -471,3 +548,55 @@ def test_real_dynamic_engine_search_preserves_seedvr2_source_fp16(adapter):
     assert result["profile"]["calibration"]["approved"] is False
     with pytest.raises(ValueError, match="批准"):
         adapter.apply(graph, result["profile"], bound_scope="behavior-only")
+
+
+def load_joint(adapter):
+    return __import__(adapter.__package__ + ".joint", fromlist=["joint"])
+
+
+def test_joint_zero_hit_is_fail_closed_with_real_cpu_projection(adapter):
+    joint = load_joint(adapter)
+    linear = torch.nn.Linear(64, 128, bias=True, dtype=torch.float16)
+    original = linear.weight.detach().clone()
+    wrapper = joint.JointProjection(linear, scope="behavior-only")
+    try:
+        with torch.inference_mode(), pytest.raises(RuntimeError, match="nonzero ANE hit"):
+            wrapper(torch.ones(1, 300, 64, dtype=torch.float16))
+        assert torch.equal(linear.weight, original)
+        assert wrapper.projection.metrics["ane_chunks"] == 0
+    finally:
+        wrapper.close()
+    assert wrapper.projection._closed
+
+
+def test_joint_requires_original_biased_fp16_input_projection(adapter):
+    joint = load_joint(adapter)
+    for linear in (
+        torch.nn.Linear(64, 128, bias=False, dtype=torch.float16),
+        torch.nn.Linear(64, 128, bias=True, dtype=torch.float32),
+    ):
+        with pytest.raises(ValueError, match="original FP16 biased"):
+            joint.JointProjection(linear, scope="behavior-only")
+
+
+def test_joint_mode_requires_explicit_approval_before_model_access(adapter, monkeypatch):
+    monkeypatch.setenv("SEEDVR2_METAL_QUANTIZATION", "joint")
+    graph = SmallGraph()
+    with pytest.raises(ValueError, match="explicit approved profile"):
+        adapter.consume_profile(graph)
+    assert graph._metal_quantization_metadata["approved"] is False
+
+
+def test_joint_calibration_requires_prequantization_scope(adapter):
+    module = __import__(adapter.__package__ + ".joint_calibration", fromlist=["calibrate"])
+    with pytest.raises(TypeError, match="bound_scope"):
+        module.calibrate(None, None, None, None, None, None, None)
+
+
+def test_joint_scope_binds_prequantization_identity_without_reopening_model(adapter):
+    joint = load_joint(adapter)
+    # This object has no packed.weight or model configuration to inspect.
+    pipeline = object()
+    first = joint.execution_scope(pipeline, bound_scope="original-full-model-a")
+    assert first == joint.execution_scope(pipeline, bound_scope="original-full-model-a")
+    assert first != joint.execution_scope(pipeline, bound_scope="original-full-model-b")

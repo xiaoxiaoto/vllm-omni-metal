@@ -1,6 +1,6 @@
 # GPU + ANE：离线校准的默认 auto
 
-`VLLM_OMNI_METAL_ANE=auto` 是默认策略，**不是强制 ANE，也不会自动改写模型 FFN**。仅显式接入通用 `DenseSwiGLU` 的模型适配器可使用；现有 activation OOT 只看到 SiLU，不包含完整投影，不能作为完整 FFN 卸载入口。
+`VLLM_OMNI_METAL_ANE=auto` 是默认策略，**不是强制 ANE，也不会自动改写模型 FFN**。仅显式接入通用 `DenseSwiGLU`、`TiledDenseSwiGLU` 或 `DenseProjection` 的模型适配器可使用；现有 activation OOT 只看到 SiLU，不包含完整投影，不能作为完整 FFN 卸载入口。
 
 ## 安装与准备
 
@@ -74,6 +74,65 @@ group.close()
 2026-10-16，本机通过私有 QwenImage overlay 使用真实官方第0层4096→12288→4096 BF16权重，完成两片静态／runtime图数值自检及1024行小张量协同调用：每片256行ANE、768行GPU，最终相对L2 **0.297%**、峰值归一误差 **0.455%**，无重算或非有限值。图发布前通过CoreML每投影ANE preferred检查；没有采集Instruments硬件trace，没有发布整模型profile。输入是诊断张量，不是模型生成时的实际激活，不能据此宣称图片质量、完整生成速度或全部32层协同已通过。
 
 QwenImage 真实单层权重 FFN 小张量协同已通过 1% 门禁，但整图验收未通过。当前 Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d` 的第0层真实生成校准执行8次调用／16个 ANE chunk；整图相对L2 **0.6697%**，scaled max **0.1294**（12.94%），超过1%门禁，未发布profile。记录在相邻源码仓库 `outputs/qwenimage-ane-20261016-run2/`；同版本 GPU off/auto 对照见 `outputs/qwenimage-gpu-ab-20261016-run6/`，auto 慢约3.6%。生产融合 AOT 因缺完整 Xcode 未构建，QwenImage 不启用未经批准的 GPU／ANE 路径；部署与限制见相邻 `docker-compose/qwen-image-2.1-turbo/README.md`。适配保持模型私有，不进入本后端 registry。
+
+## 单线性投影与联合动态量化
+
+`vllm_omni_metal.ane.projection` 提供 `prepare_projection(weight, bias, scope=...)`
+和 `DenseProjection(weight, bias, scope=..., precision="fp16")`。与整 FFN 卸载不同，
+它只计算一个真实线性投影，支持非方阵、bias、源 FP16/BF16/FP32 以及任意前导激活维；
+保留输出形状和源 dtype，不改写权重或 vLLM 的 tuple/skip-bias ABI。调用的
+`native=` 必须返回该投影的原始 Tensor，不能传整 FFN 或已量化 down。
+只有显式离线准备会生成图，且必须通过每个 matmul 的 NE preferred 计划检查。
+
+ANE 以256行为单位分担若干完整块，至少一行留给 GPU，不填充或重复短输入。bias 不参与输入重缩放；
+非有限值不能用 clipping 或替换数据掩盖。数值审计、每个实际 shape/context 和
+完整输出的 relative L2／scaled max 仍各不超过1%。`finish_audit()` 后冻结形状和 split，
+正式计时不重跑 GPU 审计，生产不搜索、编译或写策略。
+
+联合适配器在 GPU 执行原激活和 DynamicEngine down，只将未量化 gate/up 或 proj_in
+交给此 API。量化后的 down 不再保留浮点回退；原 gate/up 为 GPU 剩余行保留源参数。
+联合批准必须绑定原始 checkpoint、全部执行源码/配置、确切量化候选、图 identity、
+实际形状与完整最终媒体。ANE 的至少3%收益必须相对**相同量化 down 的 GPU 路线**
+交错测量，不能把量化本身的收益算给 ANE；两路都须 warmup，候选最慢仍快于基线最快。
+
+离线调用 `publish_projection_profile(..., publish=False)` 只返回暂存记录；
+通过 `_staged_policy` 以非 benchmark 路径重放后，释放浮点基线、核对最终输出复现，
+关闭 ANE／引擎并由独立 supervisor 确认成功，才可提交 subordinate ANE 策略和最终
+联合 profile。独立 ANE、独立量化批准不能拼接成联合批准。模型适配器须拒绝零 ANE
+命中或零真实量化调用；默认不能绕过这些门槛。
+
+本次非 editable 0.32 wheel 实际运行1024×1024 BF16 biased 投影，
+256行 ANE／257行 GPU；relative L2 0.10183%、scaled max 0.48309%，无批准发布。
+FP16/BF16/FP32、非方阵和暂存重放的15项回归亦已通过。小型128→192图未通过
+NE preferred 检查而明确拒绝；这些证据均不代表三个完整模型已获批或可设默认。
+
+## vpipe 式离线预测分配
+
+`ane.allocation.RowAllocator` 按同步实测的 GPU 秒/行与 ANE 秒/块计算：
+`T(c) = max(gpu_seconds_per_row * (M - c*C), ane_seconds_per_chunk * c)`。
+两路速率采用EMA α=0.5；枚举 `1..(M-1)//C`，预测改善严格超过5%才调整，
+避免相邻chunk数来回振荡。输入不足一个完整chunk时全GPU，不污染速率。
+这对应固定参考vpipe的行数平衡预测，不是完整移植其9样本/48-block在线开关控制器。
+
+`DenseProjection` 显式离线 `_benchmark=True` 时可调用
+`set_benchmark_chunks("auto")`；初始取接近一半的合法块数。
+计时覆盖GPU分担行的完成、ANE predict及输入/输出转换传输；每个行数/context独立建模。
+每个实际执行的split先通过原双1%完整投影审计，再用其真实两路时间更新预测；
+不把完整GPU数值审计开销记入速率。`allocation_records` 保存实测和下一步预测。
+
+`finish_audit()` 冻结**最后实际执行并审核过的split**，不采用尚未执行的预测；
+后续计时不再调整，未知shape/context拒绝，不能重新打开自动审计。
+生产仍消费已批准冻结profile，不在线试比例、编译或放宽整模型3%收益门槛。
+分配器预测本身不是质量/速度批准，也不解决Higgs短prefill或单行decode限制。
+
+```bash
+python -I -m vllm_omni_metal.ane.build --bridge
+python -I -m vllm_omni_metal.ane.projection \
+  --rows 1025 --dtype bfloat16 --bias --allocation vpipe --warmup 8
+```
+
+这是随机激活的真实NE投影烟测，不是Higgs完整TTS。仅显式离线命令准备图，
+不发布模型profile、改变部署默认或重启服务。
 
 ## 当前证据边界
 

@@ -79,11 +79,18 @@ def test_install_pins_native_wheels_and_uses_only_private_python(installer, tmp_
     assert len(installs) == 1
     for call in installs:
         assert call["args"][2:4] == ["--python", str(venv / "bin/python")]
-        assert call["target"] == "cpu" and call["version"] == "0.31.0.dev0+cpu"
-    core, metal, omni, *plugin = installs[0]["args"][4:]
-    assert "0.31.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl#sha256=" in core
-    assert "vllm_metal-0.31.0-cp312-cp312-macosx_15_0_arm64.whl#sha256=" in metal
-    assert omni.endswith("@2ec5f265c69520cdd5e5f0a19db485d38885843e")
+        assert call["target"] == "cpu" and call["version"] == "0.32.0.dev0+cpu"
+    install_args = installs[0]["args"][4:]
+    core, metal, omni, *plugin = install_args[1:]
+    assert (
+        "0.32.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl#sha256=c28cf0fede58f02c4886d2794217ec3c7e4bbd22dfeb16b4b32586a8f230bb75"
+        in core
+    )
+    assert (
+        "vllm_metal-0.32.0-cp312-cp312-macosx_15_0_arm64.whl#sha256=458d34157eb02a6bfb0e293c70485df18f72b7eb1d1ce8f1eefea95ba47ab63c"
+        in metal
+    )
+    assert omni.endswith("@d6db19b41f8c081506468859cd8f3910f77f1e5c")
     if piped:
         assert plugin == [
             "vllm-omni-metal @ git+https://github.com/xiaoxiaoto/vllm-omni-metal.git@main"
@@ -167,7 +174,10 @@ def test_install_rejects_non_commit_snapshot_before_any_changes(installer, tmp_p
 
 def test_plugin_version_matches_omni_and_source_fallback(monkeypatch):
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    assert f"vllm-omni=={project['version']}" in project["dependencies"]
+    assert any(
+        item.startswith("vllm-omni>=") and item.endswith("0.32.0.dev0")
+        for item in project["dependencies"]
+    )
 
     def missing_package(name):
         raise PackageNotFoundError(name)

@@ -47,7 +47,31 @@ def _errors(reference, candidate):
 
 
 def _captures(modules, captures):
-    from .capture import Captures
+    from .capture import Captures, DiskCaptures
+
+    if isinstance(captures, DiskCaptures):
+        captures.validate_source(modules)
+        if set(captures.names) != set(modules):
+            raise ValueError("captures must cover exactly every candidate module")
+        ordered = {name: captures.steps(name) for name in modules}
+        common_steps = None
+        for steps in ordered.values():
+            if len(steps) < 4:
+                raise ValueError("each candidate requires at least four distinct captured steps")
+            if any(type(step) is not int or step < 0 for step in steps):
+                raise ValueError("captured steps must be distinct nonnegative integers")
+            if common_steps is not None and set(steps) != common_steps:
+                raise ValueError("every candidate must have the same captured steps")
+            common_steps = set(steps)
+        metadata = captures.summary()["captures"]
+        metadata = {
+            name: [
+                {key: sample[key] for key in ("step", "shape", "dtype", "sha256")}
+                for sample in samples
+            ]
+            for name, samples in metadata.items()
+        }
+        return ordered, metadata
 
     if isinstance(captures, Captures):
         captures.validate_source(modules)
@@ -121,12 +145,71 @@ def _select(candidates):
     )
 
 
+def _trial_reason(module):
+    # Source dtype and shape are never changed to make a candidate eligible.
+    if module.weight.dtype == torch.float32:
+        return "FP32 source is retention-only"
+    if module.in_features % linear.GROUP_SIZE:
+        return "group64 alignment required"
+    return None
+
+
+def _streamed_candidates(module, captures, name, steps, source_precision, source_bytes):
+    """Reuse one full sample/reference for both packed trials, then release it."""
+    reason = _trial_reason(module)
+    quantized = {}
+    errors = {source_precision: []}
+    candidates = {}
+    try:
+        for precision, bits in (("w4a16", 4), ("w8a16", 8)):
+            if reason is not None:
+                candidates[precision] = {
+                    "passed": False,
+                    "reason": reason,
+                    "storage_bytes": None,
+                }
+            else:
+                quantized[precision] = linear.QuantizedLinear.from_linear(module, bits=bits)
+                errors[precision] = []
+        for step in steps:
+            host = captures.read(name, step)
+            if (
+                host.device.type != "cpu"
+                or host.layout != torch.strided
+                or host.dtype != module.weight.dtype
+                or host.requires_grad
+                or host.ndim < 1
+                or host.numel() == 0
+                or host.shape[-1] != module.in_features
+                or not bool(torch.isfinite(host).all())
+            ):
+                raise ValueError(
+                    "captures require finite nonempty CPU activations of matching source dtype/width"
+                )
+            tensor = host.to(device=module.weight.device).contiguous()
+            del host
+            reference = module(tensor).detach().cpu()
+            errors[source_precision].append({"step": step, **_errors(reference, reference)})
+            for precision, candidate in quantized.items():
+                errors[precision].append({"step": step, **_errors(reference, candidate(tensor))})
+            del tensor, reference
+        candidates[source_precision] = _audit(source_bytes, errors[source_precision])
+        for precision, candidate in quantized.items():
+            candidates[precision] = _audit(candidate.storage_bytes, errors[precision])
+        return candidates
+    finally:
+        quantized.clear()
+
+
 class DynamicEngine:
     """Stateless offline PTQ search and explicit, transactional profile application.
 
-    Search runs each W4/W8 candidate independently against original source outputs
-    on every captured step. It does not mutate the source tree or retain floating
-    weights. FP32 is retained only; all-source results are allowed without benefit.
+    Search runs each W4/W8 candidate against original source outputs on every
+    captured step. DiskCaptures streams one full activation/reference at a time,
+    sharing it between the two packed candidates without accumulating samples.
+    The existing in-memory capture API keeps its independent trial order.
+    Neither path mutates the source tree or retains floating weights. FP32 is
+    retained only; all-source results are allowed without claiming a benefit.
     """
 
     @staticmethod
@@ -146,6 +229,9 @@ class DynamicEngine:
         for name, module in modules.items():
             linear._linear(module, mps=True, bits=bits[name])
         ordered, fingerprints = _captures(modules, captures)
+        from .capture import DiskCaptures
+
+        streamed = isinstance(captures, DiskCaptures)
         audits = {}
         precisions = {}
         for name, module in modules.items():
@@ -156,40 +242,39 @@ class DynamicEngine:
                     if t is not None
                 )
             )
-            # Keep only the small candidate's captures/outputs alive during search.
-            inputs = [
-                (step, tensor.to(device=module.weight.device).contiguous())
-                for step, tensor in ordered[name]
-            ]
-            references = [(step, module(tensor).detach().cpu()) for step, tensor in inputs]
-            zero_errors = [
-                {"step": step, **_errors(reference, reference)} for step, reference in references
-            ]
-            candidates = {source_precisions[name]: _audit(source_bytes, zero_errors)}
-            for precision, bits in (("w4a16", 4), ("w8a16", 8)):
-                # FP32 is retention-only; never cast it to pretend quantization.
-                if module.weight.dtype == torch.float32:
-                    candidates[precision] = {
-                        "passed": False,
-                        "reason": "FP32 source is retention-only",
-                        "storage_bytes": None,
-                    }
-                    continue
-                # Unaligned layers retain source; never pad/change model semantics.
-                if module.in_features % linear.GROUP_SIZE:
-                    candidates[precision] = {
-                        "passed": False,
-                        "reason": "group64 alignment required",
-                        "storage_bytes": None,
-                    }
-                    continue
-                quantized = linear.QuantizedLinear.from_linear(module, bits=bits)
-                errors = [
-                    {"step": step, **_errors(reference, quantized(tensor))}
-                    for (step, tensor), (_, reference) in zip(inputs, references, strict=True)
+            if streamed:
+                candidates = _streamed_candidates(
+                    module, captures, name, ordered[name], source_precisions[name], source_bytes
+                )
+            else:
+                # Preserve the established in-memory API and independent trial order.
+                inputs = [
+                    (step, tensor.to(device=module.weight.device).contiguous())
+                    for step, tensor in ordered[name]
                 ]
-                candidates[precision] = _audit(quantized.storage_bytes, errors)
-                del quantized
+                references = [(step, module(tensor).detach().cpu()) for step, tensor in inputs]
+                zero_errors = [
+                    {"step": step, **_errors(reference, reference)}
+                    for step, reference in references
+                ]
+                candidates = {source_precisions[name]: _audit(source_bytes, zero_errors)}
+                for precision, trial_bits in (("w4a16", 4), ("w8a16", 8)):
+                    reason = _trial_reason(module)
+                    if reason is not None:
+                        candidates[precision] = {
+                            "passed": False,
+                            "reason": reason,
+                            "storage_bytes": None,
+                        }
+                        continue
+                    quantized = linear.QuantizedLinear.from_linear(module, bits=trial_bits)
+                    errors = [
+                        {"step": step, **_errors(reference, quantized(tensor))}
+                        for (step, tensor), (_, reference) in zip(inputs, references, strict=True)
+                    ]
+                    candidates[precision] = _audit(quantized.storage_bytes, errors)
+                    del quantized
+                del inputs, references
             chosen = _select(candidates)
             precisions[name] = chosen
             audits[name] = {
@@ -197,7 +282,8 @@ class DynamicEngine:
                 "candidates": candidates,
                 "selected": chosen,
             }
-            del inputs, references
+        if streamed:
+            captures.validate_source(modules)
         calibration = {
             "engine": "DynamicEngine",
             "implementation_sha256": _implementation_sha256(),
