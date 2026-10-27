@@ -6,12 +6,12 @@
 // variance, preserve cast-before-weight, and return a separate rounded sum.
 #include <metal_stdlib>
 using namespace metal;
-#ifndef VPIPE_ELT
-#define VPIPE_ELT half
+#ifndef ELEMENTWISE_ELT
+#define ELEMENTWISE_ELT half
 #endif
 
-inline void swiglu_generic_(const device VPIPE_ELT* gate,
-                            const device VPIPE_ELT* up, device VPIPE_ELT* out,
+inline void swiglu_generic_(const device ELEMENTWISE_ELT* gate,
+                            const device ELEMENTWISE_ELT* up, device ELEMENTWISE_ELT* out,
                             int total, int width, int out_stride, int out_off,
                             uint gid)
 {
@@ -19,7 +19,7 @@ inline void swiglu_generic_(const device VPIPE_ELT* gate,
   const uint src = width > 0 ? (gid / width) * (2 * width) + gid % width : gid;
   const float g = float(gate[src]);
   const float silu = g / (1.0f + exp(-g));
-  const VPIPE_ELT v = VPIPE_ELT(float(VPIPE_ELT(silu)) * float(up[src]));
+  const ELEMENTWISE_ELT v = ELEMENTWISE_ELT(float(ELEMENTWISE_ELT(silu)) * float(up[src]));
   if (out_stride <= 0) {
     out[gid] = v;
   } else {
@@ -31,9 +31,9 @@ inline void swiglu_generic_(const device VPIPE_ELT* gate,
 
 // Separate contiguous inputs; staged dtype rounding differs from the original.
 kernel void swiglu_f16(
-    const device VPIPE_ELT* gate [[buffer(0)]],
-    const device VPIPE_ELT* up   [[buffer(1)]],
-    device VPIPE_ELT*       out   [[buffer(2)]],
+    const device ELEMENTWISE_ELT* gate [[buffer(0)]],
+    const device ELEMENTWISE_ELT* up   [[buffer(1)]],
+    device ELEMENTWISE_ELT*       out   [[buffer(2)]],
     constant int&      n     [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
@@ -43,9 +43,9 @@ kernel void swiglu_f16(
 // Packed input rows have stride 2*width; up points at the second half.
 // 0:gate 1:up 2:out 3:rows 4:width 5:out_stride 6:out_off
 kernel void swiglu_rs_f16(
-    const device VPIPE_ELT* gate [[buffer(0)]],
-    const device VPIPE_ELT* up   [[buffer(1)]],
-    device VPIPE_ELT*       out  [[buffer(2)]],
+    const device ELEMENTWISE_ELT* gate [[buffer(0)]],
+    const device ELEMENTWISE_ELT* up   [[buffer(1)]],
+    device ELEMENTWISE_ELT*       out  [[buffer(2)]],
     constant int&      rows [[buffer(3)]],
     constant int&      width [[buffer(4)]],
     constant int&      out_stride [[buffer(5)]],
@@ -56,7 +56,7 @@ kernel void swiglu_rs_f16(
 }
 
 kernel void rope_half_part_ftab_inplace_f16(
-    device VPIPE_ELT*       x    [[buffer(0)]],
+    device ELEMENTWISE_ELT*       x    [[buffer(0)]],
     const device float*     cosb [[buffer(1)]],
     const device float*     sinb [[buffer(2)]],
     constant int&      H         [[buffer(3)]],
@@ -89,7 +89,7 @@ kernel void rope_half_part_ftab_inplace_f16(
   threadgroup_barrier(mem_flags::mem_device);
   if (live) {
     x[src + (uint)d] =
-        VPIPE_ELT((d < half_r) ? (float(VPIPE_ELT(x1 * c)) - float(VPIPE_ELT(x2 * s))) : (float(VPIPE_ELT(x2 * c)) + float(VPIPE_ELT(x1 * s))));
+        ELEMENTWISE_ELT((d < half_r) ? (float(ELEMENTWISE_ELT(x1 * c)) - float(ELEMENTWISE_ELT(x2 * s))) : (float(ELEMENTWISE_ELT(x2 * c)) + float(ELEMENTWISE_ELT(x1 * s))));
   }
 }
 
@@ -97,11 +97,11 @@ kernel void rope_half_part_ftab_inplace_f16(
 // metal/kernels_v2/rope.metal (Apache-2.0). Cache rows are already index-validated
 // by Torch; packed Q/K share one dispatch and need no input clones.
 kernel void rope_qk_cached(
-    const device VPIPE_ELT* q [[buffer(0)]],
-    const device VPIPE_ELT* k [[buffer(1)]],
-    const device VPIPE_ELT* cache [[buffer(2)]],
-    device VPIPE_ELT* out_q [[buffer(3)]],
-    device VPIPE_ELT* out_k [[buffer(4)]],
+    const device ELEMENTWISE_ELT* q [[buffer(0)]],
+    const device ELEMENTWISE_ELT* k [[buffer(1)]],
+    const device ELEMENTWISE_ELT* cache [[buffer(2)]],
+    device ELEMENTWISE_ELT* out_q [[buffer(3)]],
+    device ELEMENTWISE_ELT* out_k [[buffer(4)]],
     constant long* shape [[buffer(5)]],
     uint2 index [[thread_position_in_grid]])
 {
@@ -112,26 +112,26 @@ kernel void rope_qk_cached(
   const uint local_pair = is_q ? pair : pair - q_width / 2;
   const uint lane = local_pair % half_head;
   const uint col = local_pair / half_head * head + lane;
-  const device VPIPE_ELT* input = is_q ? q : k;
-  device VPIPE_ELT* output = is_q ? out_q : out_k;
+  const device ELEMENTWISE_ELT* input = is_q ? q : k;
+  device ELEMENTWISE_ELT* output = is_q ? out_q : out_k;
   const uint width = is_q ? q_width : k_width;
   const long base = long(row) * width + col;
   const long cache_row = long(row) * head;
   const float c = float(cache[cache_row + lane]);
   const float s = float(cache[cache_row + lane + half_head]);
   const float x = float(input[base]), y = float(input[base + half_head]);
-  output[base] = VPIPE_ELT(float(VPIPE_ELT(x * c)) - float(VPIPE_ELT(y * s)));
-  output[base + half_head] = VPIPE_ELT(float(VPIPE_ELT(y * c)) + float(VPIPE_ELT(x * s)));
+  output[base] = ELEMENTWISE_ELT(float(ELEMENTWISE_ELT(x * c)) - float(ELEMENTWISE_ELT(y * s)));
+  output[base + half_head] = ELEMENTWISE_ELT(float(ELEMENTWISE_ELT(y * c)) + float(ELEMENTWISE_ELT(x * s)));
 }
 
 // Adapted from rms_norm_fast_f16, NOT the semantically different rms_add_f16.
 // One fixed-size threadgroup per row; width is independent of threadgroup size.
 kernel void add_rms_norm_f16(
-    const device VPIPE_ELT* x        [[buffer(0)]],
-    const device VPIPE_ELT* residual [[buffer(1)]],
-    const device VPIPE_ELT* weight   [[buffer(2)]],
-    device VPIPE_ELT* out            [[buffer(3)]],
-    device VPIPE_ELT* summed         [[buffer(4)]],
+    const device ELEMENTWISE_ELT* x        [[buffer(0)]],
+    const device ELEMENTWISE_ELT* residual [[buffer(1)]],
+    const device ELEMENTWISE_ELT* weight   [[buffer(2)]],
+    device ELEMENTWISE_ELT* out            [[buffer(3)]],
+    device ELEMENTWISE_ELT* summed         [[buffer(4)]],
     constant int& H                 [[buffer(5)]],
     constant float& eps             [[buffer(6)]],
     uint3 tid      [[threadgroup_position_in_grid]],
@@ -163,8 +163,8 @@ kernel void add_rms_norm_f16(
   for (uint i = lid; i < uint(H); i += tg) {
     // Re-read the FP32 sum, never the rounded residual output.
     const float v = float(x[base + i]) + float(residual[base + i]);
-    const VPIPE_ELT normalized = VPIPE_ELT(v * inv);
-    out[base + i] = VPIPE_ELT(float(normalized) * float(weight[i]));
-    summed[base + i] = VPIPE_ELT(v);
+    const ELEMENTWISE_ELT normalized = ELEMENTWISE_ELT(v * inv);
+    out[base + i] = ELEMENTWISE_ELT(float(normalized) * float(weight[i]));
+    summed[base + i] = ELEMENTWISE_ELT(v);
   }
 }

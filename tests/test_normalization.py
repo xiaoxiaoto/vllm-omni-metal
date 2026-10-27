@@ -206,7 +206,7 @@ def test_unsupported_mps_norm_arguments_use_native_without_cpu_transfer(case):
 
 @pytest.fixture
 def explicit_norm_shader(monkeypatch):
-    from vllm_omni_metal.ops import vpipe_kernels
+    from vllm_omni_metal.ops import aot_kernels
 
     libraries = {}
 
@@ -214,13 +214,13 @@ def explicit_norm_shader(monkeypatch):
         if dtype not in libraries:
             # Isolated test opt-in only; production remains load_metallib-only.
             libraries[dtype] = torch.mps.compile_shader(
-                f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n"
-                + vpipe_kernels._SOURCE.read_text()
+                f"#define ELEMENTWISE_ELT {aot_kernels._SCALARS[dtype]}\n"
+                + aot_kernels._SOURCE.read_text()
             )
         return libraries[dtype]
 
-    monkeypatch.setattr(vpipe_kernels, "_library", library)
-    return vpipe_kernels
+    monkeypatch.setattr(aot_kernels, "_library", library)
+    return aot_kernels
 
 
 @pytest.mark.integration
@@ -271,7 +271,7 @@ def test_ir_add_rms_norm_uses_single_kernel_with_upstream_rounding(
     "case", ["missing_aot", "strided_x", "strided_residual", "strided_weight", "epsilon"]
 )
 def test_ir_add_rms_norm_keeps_omni_mps_fallback_without_jit(monkeypatch, dtype, case):
-    from vllm_omni_metal.ops import vpipe_kernels
+    from vllm_omni_metal.ops import aot_kernels
 
     torch.manual_seed(73)
     x = torch.randn(2, 3, 514, dtype=dtype, device="mps")
@@ -296,12 +296,12 @@ def test_ir_add_rms_norm_keeps_omni_mps_fallback_without_jit(monkeypatch, dtype,
     )
     monkeypatch.setattr(torch.mps, "compile_shader", lambda _: pytest.fail("worker JIT forbidden"))
     monkeypatch.setattr(
-        vpipe_kernels,
+        aot_kernels,
         "_library",
         lambda _: None if case == "missing_aot" else pytest.fail("unsupported shader load"),
     )
     monkeypatch.setattr(
-        vpipe_kernels, "add_rms_norm", lambda *a: pytest.fail("unsupported fused dispatch")
+        aot_kernels, "add_rms_norm", lambda *a: pytest.fail("unsupported fused dispatch")
     )
     op = ir.ops.fused_add_rms_norm
     with op.set_priority(["omni_mps", "native"]):

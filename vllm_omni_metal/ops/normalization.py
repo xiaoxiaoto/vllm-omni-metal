@@ -5,7 +5,7 @@
 import torch
 from vllm import ir
 
-from vllm_omni_metal.ops import vpipe_kernels
+from vllm_omni_metal.ops import aot_kernels
 
 
 def _supports_rms_norm(x, weight, epsilon, variance_size=None):
@@ -50,10 +50,10 @@ def fused_add_rms_norm(
     variance_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert weight is not None
-    if vpipe_kernels._supports_add_rms_norm_epsilon(
-        epsilon
-    ) and vpipe_kernels.supports_add_rms_norm(x, x_residual, weight):
-        return vpipe_kernels.add_rms_norm(x, x_residual, weight, epsilon)
+    if aot_kernels._supports_add_rms_norm_epsilon(epsilon) and aot_kernels.supports_add_rms_norm(
+        x, x_residual, weight
+    ):
+        return aot_kernels.add_rms_norm(x, x_residual, weight, epsilon)
     # vLLM requires variance from the unrounded FP32 sum and cast-before-weight ordering.
     summed = x.float() + x_residual.float()
     normalized = torch.nn.functional.rms_norm(

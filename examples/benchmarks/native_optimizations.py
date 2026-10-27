@@ -17,50 +17,50 @@ class BenchmarkHooks:
     """Explicit experiment controls; shader compilation is never a production fallback."""
 
     def prepare_benchmark(self, compile_for_test):
-        from vllm_omni_metal.ops import vpipe_kernels
+        from vllm_omni_metal.ops import aot_kernels
 
-        self._benchmark_library = vpipe_kernels._library
-        self._benchmark_supports_silu = vpipe_kernels.supports_silu
-        self._benchmark_supports_norm = vpipe_kernels.supports_add_rms_norm
+        self._benchmark_library = aot_kernels._library
+        self._benchmark_supports_silu = aot_kernels.supports_silu
+        self._benchmark_supports_norm = aot_kernels.supports_add_rms_norm
         self._benchmark_shader = None
         if compile_for_test:
             self._benchmark_shader = torch.mps.compile_shader(
-                "#define VPIPE_ELT bfloat\n" + vpipe_kernels._SOURCE.read_text()
+                "#define ELEMENTWISE_ELT bfloat\n" + aot_kernels._SOURCE.read_text()
             )
-        elif vpipe_kernels._library(torch.bfloat16) is None:
+        elif aot_kernels._library(torch.bfloat16) is None:
             raise RuntimeError("build metallibs first, or explicitly select --compile-for-test")
         self._benchmark_calls = {"silu": 0, "norm": 0}
-        self._benchmark_silu = vpipe_kernels.silu_and_mul
+        self._benchmark_silu = aot_kernels.silu_and_mul
 
         def silu(x):
             self._benchmark_calls["silu"] += 1
             return self._benchmark_silu(x)
 
-        vpipe_kernels.silu_and_mul = silu
-        self._benchmark_norm = vpipe_kernels.add_rms_norm
+        aot_kernels.silu_and_mul = silu
+        self._benchmark_norm = aot_kernels.add_rms_norm
 
         def norm(*args):
             self._benchmark_calls["norm"] += 1
             return self._benchmark_norm(*args)
 
-        vpipe_kernels.add_rms_norm = norm
+        aot_kernels.add_rms_norm = norm
 
     def select_benchmark_mode(self, mode):
-        from vllm_omni_metal.ops import vpipe_kernels
+        from vllm_omni_metal.ops import aot_kernels
 
         if mode not in ("baseline", "activation", "normalization", "combined"):
             raise ValueError(mode)
-        vpipe_kernels._library = (
+        aot_kernels._library = (
             (lambda dtype: None)
             if mode == "baseline"
             else (lambda dtype: self._benchmark_shader)
             if self._benchmark_shader is not None
             else self._benchmark_library
         )
-        vpipe_kernels.supports_silu = (
+        aot_kernels.supports_silu = (
             self._benchmark_supports_silu if mode in ("activation", "combined") else lambda x: False
         )
-        vpipe_kernels.supports_add_rms_norm = (
+        aot_kernels.supports_add_rms_norm = (
             self._benchmark_supports_norm
             if mode in ("normalization", "combined")
             else lambda *args: False
@@ -71,13 +71,13 @@ class BenchmarkHooks:
         return dict(self._benchmark_calls)
 
     def restore_benchmark(self):
-        from vllm_omni_metal.ops import vpipe_kernels
+        from vllm_omni_metal.ops import aot_kernels
 
-        vpipe_kernels._library = self._benchmark_library
-        vpipe_kernels.supports_silu = self._benchmark_supports_silu
-        vpipe_kernels.silu_and_mul = self._benchmark_silu
-        vpipe_kernels.supports_add_rms_norm = self._benchmark_supports_norm
-        vpipe_kernels.add_rms_norm = self._benchmark_norm
+        aot_kernels._library = self._benchmark_library
+        aot_kernels.supports_silu = self._benchmark_supports_silu
+        aot_kernels.silu_and_mul = self._benchmark_silu
+        aot_kernels.supports_add_rms_norm = self._benchmark_supports_norm
+        aot_kernels.add_rms_norm = self._benchmark_norm
 
 
 def main():

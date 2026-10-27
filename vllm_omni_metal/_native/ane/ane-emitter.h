@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef VPIPE_APPLE_SILICON_COREML_ANE_EMITTER_H
-#define VPIPE_APPLE_SILICON_COREML_ANE_EMITTER_H
+#ifndef VLLM_OMNI_METAL_ANE_EMITTER_H
+#define VLLM_OMNI_METAL_ANE_EMITTER_H
 
 #include <cstddef>
 #include <cstdint>
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace vpipe {
+namespace vllm_omni_metal::ane {
 
 // Writes a compiled CoreML model (.mlmodelc) directly, with no
 // coremltools and no Python.
@@ -172,6 +172,6 @@ class AneEmitter {
       std::span<const AneBlobSlab> weights);
 };
 
-}  // namespace vpipe
+}  // namespace vllm_omni_metal::ane
 
 #endif

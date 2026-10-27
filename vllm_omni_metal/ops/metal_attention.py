@@ -13,7 +13,34 @@ def supports_paged_attention(query, cache):
     )
 
 
-def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
+def validate_output(output, query, key, value, cache):
+    """Reject unsafe destinations before either launcher can mutate shared KV."""
+    import torch
+
+    if output is None:
+        return
+    if (
+        output.shape != query.shape
+        or output.dtype != query.dtype
+        or output.device != query.device
+        or output.layout != torch.strided
+        or output.requires_grad
+        or output.is_conj()
+        or output.is_neg()
+    ):
+        raise ValueError("output shape/device/dtype/layout must match query without autograd")
+    span = 1
+    for stride, size in sorted(zip(output.stride(), output.shape, strict=True)):
+        if size > 1:
+            if stride < span:
+                raise ValueError("output strides must not overlap")
+            span += (size - 1) * stride
+    # Conservative storage alias rejection also covers strided/padded KV views.
+    if any(torch._C._overlaps(output, tensor) for tensor in (query, key, value, cache)):
+        raise ValueError("output must not share storage with Q/K/V or KV cache")
+
+
+def paged_attention(query, key, value, cache, metadata, scale, sliding_window, output=None):
     """The caller validates shapes, dtype, strides and the whole batch before cache writes."""
     rows, heads, head_size = query.shape
     max_length = max(metadata.seq_lens)
@@ -22,6 +49,8 @@ def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
     scratch_bytes = rows * heads * partitions * (head_size * query.element_size() + 8)
     if scratch_bytes > 256 * 1024**2:
         raise ValueError("Metal attention scratch estimate exceeds the 256 MiB per-call budget")
+    if output is not None:
+        validate_output(output, query, key, value, cache)
 
     width = max((length + cache.shape[2] - 1) // cache.shape[2] for length in metadata.seq_lens)
     tables = []
@@ -47,7 +76,13 @@ def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
                 >= 2**31
             ):
                 raise ValueError("Torch-stream attention strides must fit int32")
-            result = torch.empty_like(query, memory_format=torch.contiguous_format)
+            # Only a contiguous view is accepted by the shader. Other valid layouts
+            # retain the necessary copy, as does the cross-framework bridge below.
+            result = (
+                output.view_as(query)
+                if output is not None and output.is_contiguous()
+                else torch.empty_like(query, memory_format=torch.contiguous_format)
+            )
             sequences = len(metadata.seq_lens)
             table_elements = sequences * width
             # One asynchronous transfer for the int32 metadata; keep copies on the Torch stream.
@@ -74,6 +109,10 @@ def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
                 0.0,
                 1,
             )
+            if output is not None:
+                if not output.is_contiguous():
+                    output.copy_(result.reshape_as(output))
+                return output
             return result.reshape(rows, -1)
 
     import mlx.core as mx
@@ -102,4 +141,8 @@ def paged_attention(query, key, value, cache, metadata, scale, sliding_window):
         sliding_window if sliding_window is not None else -1,
     )
     mx.eval(result)
-    return mlx_to_torch(result, query.device).reshape(rows, -1)
+    result = mlx_to_torch(result, query.device).reshape(rows, -1)
+    if output is not None:
+        output.copy_(result.reshape_as(output))
+        return output
+    return result

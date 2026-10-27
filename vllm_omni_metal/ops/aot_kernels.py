@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Generic vpipe ports; optional metallibs are built explicitly, never by workers."""
+"""Generic Metal AOT kernels; metallibs are built explicitly, never by workers."""
 
 import argparse
 import fcntl
@@ -17,7 +17,7 @@ import torch
 
 from vllm_omni_metal.ops.mps_attention import _check_artifact, _check_private_directory
 
-_SOURCE = Path(__file__).parents[1] / "_native/vpipe_elementwise.metal"
+_SOURCE = Path(__file__).parents[1] / "_native/elementwise.metal"
 _SCALARS = {torch.float32: "float", torch.float16: "half", torch.bfloat16: "bfloat"}
 
 
@@ -26,7 +26,7 @@ def _artifact_path(dtype):
     digest.update(torch.__version__.encode())
     return (
         Path.home()
-        / ".cache/vllm-omni-metal/vpipe"
+        / ".cache/vllm-omni-metal/aot/elementwise"
         / digest.hexdigest()
         / f"{_SCALARS[dtype]}.metallib"
     )
@@ -41,15 +41,15 @@ def _library(dtype):
     return torch.mps.load_metallib(path)
 
 
-def build_vpipe_kernels():
+def build_elementwise_kernels():
     """Offline, explicit Metal compiler invocation; no tool installation or dependency changes."""
     if (
         psutil.virtual_memory().available < 3 * 1024**3
         or shutil.disk_usage(Path.home()).free < 512 * 1024**2
     ):
-        raise RuntimeError("vpipe build budget requires 3 GiB headroom and 512 MiB disk")
+        raise RuntimeError("elementwise build budget requires 3 GiB headroom and 512 MiB disk")
     if not shutil.which("xcrun"):
-        raise RuntimeError("vpipe build requires an already installed Apple Metal compiler")
+        raise RuntimeError("elementwise build requires an already installed Apple Metal compiler")
     found = subprocess.run(["xcrun", "--find", "metal"], capture_output=True, text=True, timeout=5)
     if found.returncode:
         raise RuntimeError("Apple Metal compiler unavailable; no tools are installed automatically")
@@ -67,7 +67,7 @@ def build_vpipe_kernels():
                 source = Path(temporary) / "ops.metal"
                 air = Path(temporary) / "ops.air"
                 target = Path(temporary) / "ops.metallib"
-                source.write_text(f"#define VPIPE_ELT {scalar}\n" + _SOURCE.read_text())
+                source.write_text(f"#define ELEMENTWISE_ELT {scalar}\n" + _SOURCE.read_text())
                 subprocess.run(
                     [
                         "xcrun",
@@ -158,9 +158,9 @@ def _supports_add_rms_norm_epsilon(epsilon):
 def add_rms_norm(x, residual, weight, epsilon):
     """Return (cast-before-weight RMSNorm, cast residual sum), without mutation."""
     if not _supports_add_rms_norm_epsilon(epsilon):
-        raise ValueError("vpipe add_rms_norm requires zero or finite normal FP32 epsilon")
+        raise ValueError("AOT add_rms_norm requires zero or finite normal FP32 epsilon")
     if not supports_add_rms_norm(x, residual, weight):
-        raise ValueError("unsupported vpipe add_rms_norm inputs or missing AOT artifact")
+        raise ValueError("unsupported AOT add_rms_norm inputs or missing artifact")
     result = torch.empty_like(x)
     summed = torch.empty_like(x)
     # Fixed 256-thread groups, not width threads: wide rows stride safely and
@@ -255,7 +255,7 @@ def _diffusion_artifact_path(dtype):
     digest.update(str(Path(torch.__file__).resolve()).encode())
     return (
         Path.home()
-        / ".cache/vllm-omni-metal/diffusion"
+        / ".cache/vllm-omni-metal/aot/diffusion"
         / digest.hexdigest()
         / f"{_SCALARS[dtype]}.metallib"
     )
@@ -372,12 +372,161 @@ def interleaved_rotary(x, freqs):
     return result
 
 
+def _diffusion_tensor_supported(x):
+    return (
+        x.device.type == "mps"
+        and x.dtype in _SCALARS
+        and x.is_contiguous()
+        and not x.requires_grad
+        and not x.is_neg()
+        and not x.is_conj()
+        and x.storage_offset() == 0
+        and 0 < x.numel() < 2**31
+    )
+
+
+def _broadcast_matches(x, shape):
+    try:
+        return torch.broadcast_shapes(x.shape, shape) == shape
+    except RuntimeError:
+        return False
+
+
+def supports_gated_residual_rms_adaln(residual, branch, gate, weight, shift, scale, eps):
+    """Validated public inputs; conservative AOT domain, general broadcast strides."""
+    return (
+        0 < residual.ndim <= 8
+        and 0 < residual.shape[-1] <= (7168 if residual.dtype == torch.float32 else 14336)
+        and branch.shape == residual.shape
+        and weight.shape == (residual.shape[-1],)
+        and all(
+            x.dtype == residual.dtype and x.device == residual.device
+            for x in (branch, gate, weight, shift, scale)
+        )
+        and all(_broadcast_matches(x, residual.shape) for x in (gate, shift, scale))
+        and all(
+            _diffusion_tensor_supported(x) for x in (residual, branch, gate, weight, shift, scale)
+        )
+        and _supports_add_rms_norm_epsilon(eps)
+        and _diffusion_library(residual.dtype) is not None
+    )
+
+
+def _broadcast_descriptor(x, shape):
+    strides = (0,) * (len(shape) - x.ndim) + x.stride()
+    sizes = (1,) * (len(shape) - x.ndim) + tuple(x.shape)
+    return tuple(0 if size == 1 else stride for size, stride in zip(sizes, strides, strict=True))
+
+
+def gated_residual_rms_adaln(residual, branch, gate, weight, shift, scale, eps):
+    """Single dispatch, one group per row; no persistent/shared request scratch."""
+    if not supports_gated_residual_rms_adaln(residual, branch, gate, weight, shift, scale, eps):
+        raise ValueError("unsupported gated residual AdaLN inputs or missing AOT artifact")
+    result, rounded = torch.empty_like(residual), torch.empty_like(residual)
+    shape = tuple(residual.shape)
+    descriptor = (len(shape),) + shape
+    for x in (gate, shift, scale):
+        descriptor += _broadcast_descriptor(x, shape)
+    _diffusion_library(residual.dtype).gated_residual_rms_adaln(
+        residual,
+        branch,
+        gate,
+        weight,
+        shift,
+        scale,
+        result,
+        rounded,
+        descriptor,
+        float(eps),
+        threads=(256, residual.numel() // shape[-1]),
+        group_size=(256, 1),
+    )
+    return result, rounded
+
+
+def supports_qk_norm_rotary(
+    query, key, query_weight, key_weight, freqs, query_eps=1e-6, key_eps=1e-6
+):
+    return (
+        query.ndim == 4
+        and key.ndim == 4
+        and query.shape[:2] == key.shape[:2]
+        and query.shape[-1] == key.shape[-1]
+        and query.dtype == key.dtype
+        and query.device == key.device
+        and query.shape[2] > 0
+        and key.shape[2] > 0
+        and 0 < query.shape[-1] <= 65536
+        and query.shape[-1] % 2 == 0
+        and _diffusion_tensor_supported(query)
+        and _diffusion_tensor_supported(key)
+        and all(
+            weight is None
+            or (
+                weight.dtype == query.dtype
+                and weight.device == query.device
+                and weight.shape == (query.shape[-1],)
+                and _diffusion_tensor_supported(weight)
+            )
+            for weight in (query_weight, key_weight)
+        )
+        and freqs.is_contiguous()
+        and not freqs.is_conj()
+        and not freqs.is_neg()
+        and not freqs.requires_grad
+        and freqs.storage_offset() == 0
+        and freqs.dtype == torch.complex64
+        and freqs.device == query.device
+        and freqs.shape
+        in (
+            (query.shape[1], query.shape[-1] // 2),
+            (1, query.shape[1], query.shape[-1] // 2),
+            (query.shape[0], query.shape[1], query.shape[-1] // 2),
+        )
+        and _supports_add_rms_norm_epsilon(query_eps)
+        and _supports_add_rms_norm_epsilon(key_eps)
+        and _diffusion_library(query.dtype) is not None
+    )
+
+
+def qk_norm_rotary(query, key, query_weight, key_weight, freqs, query_eps=1e-6, key_eps=1e-6):
+    """Single dispatch across both Q and K heads, no norm intermediate tensors."""
+    if not supports_qk_norm_rotary(query, key, query_weight, key_weight, freqs, query_eps, key_eps):
+        raise ValueError("unsupported QK norm rotary inputs or missing AOT artifact")
+    q_out, k_out = torch.empty_like(query), torch.empty_like(key)
+    b, s, qh, d = query.shape
+    kh = key.shape[2]
+    _diffusion_library(query.dtype).qk_norm_rotary(
+        query,
+        key,
+        query if query_weight is None else query_weight,
+        key if key_weight is None else key_weight,
+        torch.view_as_real(freqs),
+        q_out,
+        k_out,
+        (
+            s,
+            qh,
+            kh,
+            d,
+            int(freqs.ndim == 3 and freqs.shape[0] != 1),
+            int(query_weight is not None),
+            int(key_weight is not None),
+        ),
+        float(query_eps),
+        float(key_eps),
+        threads=(256, b * s * (qh + kh)),
+        group_size=(256, 1),
+    )
+    return q_out, k_out
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--diffusion", action="store_true", help="Also prepare interleaved diffusion RoPE"
+        "--diffusion", action="store_true", help="Also prepare diffusion rotary and norm fusions"
     )
     args = parser.parse_args()
-    print(build_vpipe_kernels())
+    print(build_elementwise_kernels())
     if args.diffusion:
         print(build_diffusion_kernels())

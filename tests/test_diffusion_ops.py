@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from diffusers.models.normalization import RMSNorm
 
 from vllm_omni_metal.diffusion import ops
-from vllm_omni_metal.ops import vpipe_kernels as kernels
+from vllm_omni_metal.ops import aot_kernels as kernels
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 MPS = pytest.mark.skipif(
@@ -294,7 +294,7 @@ def test_mps_large_separate_silu_reuses_mlx_without_packing(monkeypatch, dtype):
 def test_explicit_test_shaders_separate_silu_and_interleaved_rotary(monkeypatch, dtype, head_dim):
     # Explicit isolated numerical test only; this is NOT the production AOT loader.
     elementwise = torch.mps.compile_shader(
-        f"#define VPIPE_ELT {kernels._SCALARS[dtype]}\n" + kernels._SOURCE.read_text()
+        f"#define ELEMENTWISE_ELT {kernels._SCALARS[dtype]}\n" + kernels._SOURCE.read_text()
     )
     rotary_library = torch.mps.compile_shader(
         f"#define DIFFUSION_ELT {kernels._SCALARS[dtype]}\n"

@@ -12,7 +12,7 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
 
-from vllm_omni_metal.ops import vpipe_kernels
+from vllm_omni_metal.ops import aot_kernels
 from vllm_omni_metal.ops.activation import MetalSiluAndMul, _supports_compiled_silu
 
 
@@ -38,14 +38,14 @@ def main():
     ):
         parser.error("benchmark exceeds 64 MiB budget or 3 GiB system headroom")
     dtype = getattr(torch, args.dtype)
-    original_library = vpipe_kernels._library
-    original_supports = vpipe_kernels.supports_silu
+    original_library = aot_kernels._library
+    original_supports = aot_kernels.supports_silu
     if args.compile_for_test:
         library = torch.mps.compile_shader(
-            f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n"
-            + vpipe_kernels._SOURCE.read_text()
+            f"#define ELEMENTWISE_ELT {aot_kernels._SCALARS[dtype]}\n"
+            + aot_kernels._SOURCE.read_text()
         )
-        vpipe_kernels._library = lambda _: library
+        aot_kernels._library = lambda _: library
     torch.manual_seed(29)
     x = torch.randn(args.rows, 2 * args.hidden_size, dtype=dtype, device="mps")
     saved = x.clone()
@@ -64,7 +64,7 @@ def main():
             for iteration in range(args.iterations + 10):
                 order = routes if iteration % 2 == 0 else tuple(reversed(routes))
                 for route in order:
-                    vpipe_kernels.supports_silu = (
+                    aot_kernels.supports_silu = (
                         (lambda unused: False) if route == "previous_mps" else original_supports
                     )
                     fn = SiluAndMul.forward_native if route == "native" else layer
@@ -81,8 +81,8 @@ def main():
                         assert actual.device.type == "mps" and actual.dtype == dtype
                         assert torch.isfinite(actual).all()
     finally:
-        vpipe_kernels._library = original_library
-        vpipe_kernels.supports_silu = original_supports
+        aot_kernels._library = original_library
+        aot_kernels.supports_silu = original_supports
     torch.testing.assert_close(x, saved, atol=0, rtol=0)
     medians = {route: statistics.median(values) for route, values in samples.items()}
     speedup = medians["native"] / medians["optimized"]

@@ -132,3 +132,64 @@ def test_cpu_and_unsupported_geometry_do_not_select_native_kernels():
 
     cache = torch.zeros(2, 4, 16, 1, 64)
     assert not supports_paged_attention(torch.ones(1, 2, 64), cache)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "dtype",
+        "device",
+        "expanded",
+        "strided_overlap",
+        "query",
+        "key",
+        "value",
+        "cache",
+        "autograd",
+    ],
+)
+def test_invalid_output_never_mutates_kv(case):
+    impl = MetalAttentionImpl(2, 4, 0.5, 1)
+    q = torch.ones(2, 2, 4)
+    k = torch.ones(2, 1, 4)
+    v = torch.ones_like(k)
+    cache = torch.zeros(2, 4, 2, 1, 4)
+    metadata = MetalAttentionMetadata([0, 1, 2], [1, 1], [[0], [3]])
+    if case == "dtype":
+        output = torch.empty_like(q, dtype=torch.float16)
+    elif case == "device":
+        output = torch.empty_like(q, device="meta")
+    elif case == "expanded":
+        output = torch.empty(1, 2, 4).expand_as(q)
+    elif case == "strided_overlap":
+        output = torch.empty(16).as_strided(q.shape, (1, 4, 1))
+    elif case == "query":
+        output = q
+    elif case in ("key", "value"):
+        output = torch.empty_like(q)
+        if case == "key":
+            k = output[:, :1]
+        else:
+            v = output[:, :1]
+    elif case == "cache":
+        output = cache.flatten()[: q.numel()].view_as(q)
+    else:
+        output = torch.empty_like(q, requires_grad=True)
+    with pytest.raises(ValueError, match="output"):
+        impl.forward(None, q, k, v, cache, metadata, output=output)
+    assert torch.count_nonzero(cache) == 0
+
+
+def test_noncontiguous_output_retains_copy_semantics():
+    impl = MetalAttentionImpl(2, 4, 0.5, 1)
+    q = torch.ones(2, 2, 4)
+    k = torch.ones(2, 1, 4)
+    v = torch.arange(8, dtype=torch.float32).view(2, 1, 4)
+    cache = torch.zeros(2, 4, 2, 1, 4)
+    metadata = MetalAttentionMetadata([0, 1, 2], [1, 1], [[0], [3]])
+    backing = torch.full((2, 2, 8), -99.0)
+    output = backing[..., ::2]
+    actual = impl.forward(None, q, k, v, cache, metadata, output=output)
+    assert actual is output
+    torch.testing.assert_close(actual, v.expand_as(q))
+    assert (backing[..., 1::2] == -99).all()

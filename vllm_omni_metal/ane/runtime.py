@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 def execution_scope(revision, config):
     """Bind pipeline calibration to execution settings, not a model name."""
+    from vllm_omni_metal.ops.aot_kernels import _artifact_path
     from vllm_omni_metal.ops.mps_attention import get_mps_ops
-    from vllm_omni_metal.ops.vpipe_kernels import _artifact_path
 
     cache = config.cache_config
     descriptor = {

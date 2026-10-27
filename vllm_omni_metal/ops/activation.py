@@ -7,7 +7,7 @@ import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.activation import SiluAndMul
 
-from vllm_omni_metal.ops import vpipe_kernels
+from vllm_omni_metal.ops import aot_kernels
 
 # shortcut: bridge overhead loses on small decode inputs; remeasure before lowering this gate.
 MIN_COMPILED_ELEMENTS = 262144
@@ -38,8 +38,8 @@ def _compiled_silu_and_mul():
 
 
 def _silu_and_mul_mps(x: torch.Tensor) -> torch.Tensor:
-    if vpipe_kernels.supports_silu(x):
-        return vpipe_kernels.silu_and_mul(x)
+    if aot_kernels.supports_silu(x):
+        return aot_kernels.silu_and_mul(x)
 
     import mlx.core as mx
     from vllm_metal.tensor_bridge import mlx_to_torch, torch_to_mlx

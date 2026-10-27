@@ -713,7 +713,7 @@ def main():
     parser.add_argument("--rows", type=int, default=513)
     parser.add_argument("--bias", action="store_true")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
-    parser.add_argument("--allocation", choices=("fixed", "vpipe"), default="fixed")
+    parser.add_argument("--allocation", choices=("fixed", "predictive"), default="fixed")
     parser.add_argument("--warmup", type=int, default=8)
     args = parser.parse_args()
     if args.rows <= artifacts.CHUNK:
@@ -736,10 +736,10 @@ def main():
         with DenseProjection(
             weight, bias, scope="explicit-linear-numerical-smoke-v1", _benchmark=True
         ) as p:
-            p.set_benchmark_chunks("auto" if args.allocation == "vpipe" else 1)
-            for _ in range(args.warmup if args.allocation == "vpipe" else 1):
+            p.set_benchmark_chunks("auto" if args.allocation == "predictive" else 1)
+            for _ in range(args.warmup if args.allocation == "predictive" else 1):
                 p(x, native=lambda value: F.linear(value, weight, bias))
-            if args.allocation == "vpipe":
+            if args.allocation == "predictive":
                 p.finish_audit()
                 for _ in range(2):
                     p(x, native=lambda value: F.linear(value, weight, bias))

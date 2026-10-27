@@ -81,8 +81,8 @@ def test_unrelated_shader_and_notice_do_not_invalidate_host_artifact(tmp_path, m
     shutil.copytree(mps_attention._NATIVE, native)
     monkeypatch.setattr(mps_attention, "_NATIVE", native)
     original = mps_attention._artifact_path()
-    (native / "vpipe_elementwise.metal").write_text("unrelated shader change")
-    (native / "VPIPE.md").write_text("unrelated notice change")
+    (native / "elementwise.metal").write_text("unrelated shader change")
+    (native / "THIRD_PARTY_NOTICES.md").write_text("unrelated notice change")
     assert mps_attention._artifact_path() == original
 
 
@@ -174,3 +174,76 @@ assert sys.modules['mlx'] is None and sys.modules['mlx.core'] is None
         text=True,
         timeout=30,
     )
+
+
+@pytest.mark.integration
+@MPS
+@pytest.mark.parametrize("flattened", [False, True])
+def test_native_writes_caller_output_without_result_copy(flattened, monkeypatch):
+    from vllm_omni_metal.native.attention import MetalAttentionImpl, MetalAttentionMetadata
+
+    if mps_attention.get_mps_ops() is None:
+        pytest.skip("optional launcher has not been explicitly built")
+    impl = MetalAttentionImpl(4, 64, 0.125, 2)
+    shape = (2, 256) if flattened else (2, 4, 64)
+    q = torch.ones(shape, device="mps")
+    k = torch.ones(2, 2, 64, device="mps")
+    v = torch.arange(256, dtype=torch.float32, device="mps").view(2, 2, 64)
+    cache = torch.zeros(2, 4, 16, 2, 64, device="mps")
+    backing = torch.full((q.numel() + 16,), -99.0, device="mps")
+    output = backing[8:-8].view(shape)
+    meta = MetalAttentionMetadata([0, 1, 2], [1, 1], [[1], [3]])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("contiguous native output must not use result.copy_")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(torch.Tensor, "copy_", forbidden)
+        actual = impl.forward(None, q, k, v, cache, meta, output=output)
+    assert actual is output
+    expected = v.repeat_interleave(2, dim=1).reshape(shape)
+    torch.testing.assert_close(actual, expected)
+    assert (backing[:8] == -99).all() and (backing[-8:] == -99).all()
+
+
+@pytest.mark.integration
+@MPS
+@pytest.mark.parametrize("case", ["alias_q", "alias_cache", "expanded", "shape", "dtype", "device"])
+def test_launcher_rejects_invalid_output_before_scatter(case):
+    native = mps_attention.get_mps_ops()
+    if native is None:
+        pytest.skip("optional launcher has not been explicitly built")
+    q = torch.ones(1, 4, 64, device="mps")
+    k = torch.ones(1, 2, 64, device="mps")
+    cache = torch.zeros(2, 2, 16, 2, 64, device="mps")
+    if case == "alias_q":
+        output = q
+    elif case == "alias_cache":
+        output = cache.flatten()[: q.numel()].view_as(q)
+    elif case == "expanded":
+        output = torch.empty(1, 1, 64, device="mps").expand_as(q)
+    elif case == "shape":
+        output = torch.empty(1, 3, 64, device="mps")
+    elif case == "dtype":
+        output = torch.empty_like(q, dtype=torch.float16)
+    else:
+        output = torch.empty_like(q, device="cpu")
+    with pytest.raises(RuntimeError):
+        native.forward(
+            q,
+            k,
+            k,
+            cache[0],
+            cache[1],
+            torch.tensor([0], dtype=torch.int64, device="mps"),
+            torch.tensor([[0]], dtype=torch.int32, device="mps"),
+            torch.tensor([1], dtype=torch.int32, device="mps"),
+            torch.tensor([0, 1], dtype=torch.int32, device="mps"),
+            output,
+            1,
+            0.125,
+            -1,
+            0.0,
+            1,
+        )
+    assert torch.count_nonzero(cache).item() == 0

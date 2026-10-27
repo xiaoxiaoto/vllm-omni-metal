@@ -256,7 +256,7 @@ def prepare_group(weights, *, scope="dense-swiglu"):
     weights = tuple(weights)
     if not weights or not all(artifacts.eligible(*pair) for pair in weights):
         raise ValueError("ANE requires tile-aligned dense FP16/BF16 SwiGLU weights")
-    if "VPIPE_ANE_SILU_OP" in os.environ:
+    if "VLLM_OMNI_METAL_ANE_SILU_OP" in os.environ:
         raise ValueError("ANE preparation requires the verified stable SiLU graph")
     root = build_tools()
     bridge = _Bridge()
@@ -327,7 +327,7 @@ def prepare_tiled_group(weights, *, scope):
         raise ValueError("ANE requires dense FP16/BF16 SwiGLU weights")
     plans = [artifacts.inner_tiles(*shape) for shape in shapes]
     artifacts.group_key([], scope)
-    if "VPIPE_ANE_SILU_OP" in os.environ:
+    if "VLLM_OMNI_METAL_ANE_SILU_OP" in os.environ:
         raise ValueError("ANE preparation requires the verified stable SiLU graph")
     largest = max(
         6 * hidden * (end - start)
@@ -393,7 +393,7 @@ def main():
         "--bridge",
         action="store_true",
         required=True,
-        help="构建 Swift/CoreML bridge 与 vpipe emitter；模型权重和整流水线校准由独立适配器准备",
+        help="构建 Swift/CoreML bridge 与 ANE emitter；模型权重和整流水线校准由独立适配器准备",
     )
     parser.parse_args()
     print(build_tools())

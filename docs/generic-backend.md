@@ -461,17 +461,74 @@ ABC为2006文本token加真实151848结束符，但原文存在畸形拍号头�
 
 `diffusion/ops.py` 提供 `silu_mul(gate, up)`、`rms_norm(x, weight, eps)` 和 `rotary(x, complex_freqs)`，仅由适配器显式调用，不全局替换模型类或 registry。`use_optimizations(False)` 用局部 ContextVar 保留精确 Torch 基线；`metrics_snapshot()` 只计实际成功路径，缺 AOT 的 Torch 后备不计为融合命中。
 
-- SwiGLU 独立输入复用现有 vpipe `swiglu_f16` 或大输入 MLX bridge，避免大激活 `cat`；保留 SiLU FP32计算、cast后再乘up的舍入。
+- SwiGLU 独立输入复用现有通用 elementwise `swiglu_f16` 或大输入 MLX bridge，避免大激活 `cat`；保留 SiLU FP32计算、cast后再乘up的舍入。
 - RMSNorm 遵守 Diffusers FP32 variance、根据weight dtype选择pre-affine cast的合同，不把vLLM的无条件cast规则混入。只在匹配域使用无learned-weight的Torch MPS fused norm，再按原顺序应用weight。
-- RoPE 为 adjacent real/imag、complex64／FP32乘法，既不是NeoX split-half，也不是低精度乘法逐项舍入。随包 `_native/diffusion_rotary.metal` 是独立AOT源码；`python -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion` 显式准备，生产只加载匹配metallib，不在worker/request使用 `compile_shader`。
+- RoPE 为 adjacent real/imag、complex64／FP32乘法，既不是NeoX split-half，也不是低精度乘法逐项舍入。随包 `_native/diffusion_rotary.metal` 是独立AOT源码；`python -I -m vllm_omni_metal.ops.aot_kernels --diffusion` 显式准备，生产只加载匹配metallib，不在worker/request使用 `compile_shader`。
 - CPU、合法广播／混合dtype、非连续、梯度或其他不匹配输入保留原设备的原Torch数学路径；没有隐式转CPU。
 
 `MetalDiffusionWorker.shutdown()` 会调用pipeline可选的 `close_metal_operators()`，并在该钩子失败时仍释放上游runner、KV／offload及分布式资源，重复shutdown不重复关闭。私有pipeline负责持有不可变权重组及每请求作用域，不接管HTTP、采样或codec。
 
 QwenImage 接线在相邻部署的私有 Omni wheel：仅替换数学合同匹配的 FFN/RMSNorm/RoPE 入口，GPU开关保守默认off，ANE只消费完整生成校准的profile。通用代码未内置其模型名、层数、checkpoint路径或拓扑。AR paged-attention／分页KV、NeoX缓存表、add-before-RMSNorm不适用于其diffusion条件前缀／interleaved RoPE／LayerNorm，不以关闭检查来伪装兼容。
 
-当前新算子已通过CPU/MPS、舍入／布局／梯度边界及隔离shader回归；隔离编译不是生产AOT证据。本机缺完整Xcode，Apple官方工具链命令无法执行。当前QwenImage Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d` 上，512×512 GPU off/auto输出一致，但auto慢约3.6%，因此部署保留off；第0层ANE协同虽通过单FFN误差门禁，整图scaled max 12.94%超过1%，未发布profile。不能宣称 GPU／ANE 加速。具体记录见[安装说明](installation.md)、[分片ANE](ane.md)和模型部署文档。
+此前算子接入已通过CPU/MPS、舍入／布局／梯度边界及隔离shader回归；当时缺少工具链，隔离编译不是生产AOT证据。本次新增P0/P1的工具链与AOT状态单独记录于下节，不改写历史模型结论。此前QwenImage Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d` 上，512×512 GPU off/auto输出一致，但auto慢约3.6%，因此部署保留off；第0层ANE协同虽通过单FFN误差门禁，整图scaled max 12.94%超过1%，未发布profile。不能宣称 GPU／ANE 加速。具体记录见[安装说明](installation.md)、[分片ANE](ane.md)和模型部署文档。
 
+
+### 输出复用与跨算子融合：P0 / P1
+
+参考 [h3.c `8974cc0`](https://github.com/antirez/h3.c/tree/8974cc055ea9c02fcd14cc27dfda3e1027c05153)
+的生命周期复用和精确舍入边界融合，独立实现以下通用机制，未复制 H3 shader、
+模型、采样器、TensorOps/int8 或 checkpoint loader。
+
+**P0 attention 输出与工作区。** 连续的 caller-owned 2D/3D output 直接绑定到
+Torch-stream launcher，支持非零 storage offset；不再先分配 attention result 后复制。
+非连续合法输出、MLX bridge 和原设备 SDPA 后备保留必要复制。输出 shape/dtype/device、
+内部重叠、autograd 和 storage alias 在 KV 写入前校验；保守拒绝与 Q/K/V/KV 共用
+storage 的输出，包括同 storage 内实际不相交的 views。
+
+每个 native `PagedAttention` 实例仅缓存一组最新 split scratch，属于首次 split 的
+Torch stream，容量不足或 dtype 改变时替换，总持久容量不超过256MiB；其他 stream
+使用私有临时缓冲。CPU mutex 保持整次编码有序，reducer 后的 buffer barrier 保护
+下一次 scratch 写入，不增加逐调用 GPU wait。新分配保留3GiB系统 headroom；
+原256MiB每调用预算不变。没有缓存输出，先前返回值不会被后次请求覆写。
+
+**P1 显式融合入口：**
+
+```python
+from vllm_omni_metal.diffusion.ops import gated_residual_rms_adaln, qk_norm_rotary
+
+normalized, rounded_residual = gated_residual_rms_adaln(
+    residual, branch, gate, weight, shift, scale, eps,
+)
+query_out, key_out = qk_norm_rotary(
+    query, key, query_weight, key_weight, complex_freqs,
+    query_eps=1e-6, key_eps=1e-6,
+)
+```
+
+- `gated_residual_rms_adaln`：residual/branch同shape；weight为[D]；
+  gate/shift/scale右对齐广播但不得扩大residual，全部同dtype/device。
+  先以FP32计算 `residual + branch * gate`，舍入到源dtype，再由舍入后的residual
+  计算FP32 variance。归一化先cast，再乘weight并舍入；`1+scale`、modulation乘法、
+  shift加法各保留源dtype舍入。它是RMS型AdaLN，不是mean-subtract LayerNorm，
+  也不等于vLLM从未舍入FP32和计算variance的add-RMSNorm。
+  单dispatch同时写回residual并将其保留在threadgroup memory，不从device重读整行；
+  每group共28704字节。AOT行宽上限FP32为7168、FP16/BF16为14336，rank至多8。
+- `qk_norm_rotary`：BSHD Q/K共用B/S/D，head数可不同；独立可选[D] weight及epsilon。
+  保留Diffusers按weight dtype决定norm cast的规则，然后FP32 adjacent complex旋转，
+  最后cast回norm输出dtype。频率为complex64 `[S,D/2]`、`[1,S,D/2]`或`[B,S,D/2]`。
+  单dispatch处理Q/K，不分配norm中间张量；不是NeoX，也未融合AR分页KV写入。
+  AOT要求weight为None或与输入同dtype，正偶数D不超过65536。
+- 两者优化域均为连续、零storage offset、无梯度的MPS FP16/BF16/FP32。
+  合法views、混合Q/K weight dtype、空行、超宽或其他不匹配输入保留精确同设备Torch
+  路径；非法参数报错，不隐式cast输入或转CPU。FP32 reduction tree可能造成末位差异，
+  不承诺所有输入逐位一致；rounded residual单独要求精确一致。
+- 生产复用现有diffusion AOT构建、私有缓存和源码指纹；无匹配产物走Torch，不在线编译。
+  `use_optimizations(False)`直接选择Torch oracle，`:aot` metrics才表示融合实际命中。
+  适配器须显式接入，不自动改模型block、modulation切片、registry或部署默认值。
+
+本次M4 Pro小张量真实AOT烟测已覆盖三种dtype、GQA、广播、attention偏移输出和排队
+重放；不等于完整模型质量或吞吐验收。指定形状的QK融合有收益，gated AdaLN尚未证明
+稳定加速，不把减少dispatch直接等同于提速。安装与本次回归证据见[安装说明](installation.md)。
 
 ## 原生阶段
 
@@ -544,7 +601,7 @@ M4 Pro、BF16 batch4/context2048、Q/KV heads16/4、head128，20 次同步中位
 
 优化只选择 MPS FP16/BF16、非空输入、同 dtype/device 且宽度匹配的一维 learned weight、无 variance override。残差另外要求相同 shape/device/dtype。CPU、FP32、无 weight、部分 variance、混合权重或广播等原生合法参数仍交给上游 native；不把 MPS tensor 搬到 CPU，不忽略其他不支持配置。
 
-残差使用 FP32 sum 计算 variance，再按 vLLM 顺序先 cast normalized 值后乘 learned weight，并单独返回 cast 后的 residual sum；输入不就地改写。有匹配的显式 vpipe AOT 产物时，连续、无梯度 FP16/BF16 输入选择改编自 `rms_norm_fast_f16` 的 add-before-norm 单 kernel；保留非连续、梯度、缺产物以及不适合 Metal FP32 常量的 epsilon（负数、非有限、溢出或非零 subnormal）的原 Torch 分解，不扩大原 IR provider 支持域。
+残差使用 FP32 sum 计算 variance，再按 vLLM 顺序先 cast normalized 值后乘 learned weight，并单独返回 cast 后的 residual sum；输入不就地改写。有匹配的显式通用 elementwise AOT 产物时，连续、无梯度 FP16/BF16 输入选择改编自 `rms_norm_fast_f16` 的 add-before-norm 单 kernel；保留非连续、梯度、缺产物以及不适合 Metal FP32 常量的 epsilon（负数、非有限、溢出或非零 subnormal）的原 Torch 分解，不扩大原 IR provider 支持域。
 
 `tests/test_normalization.py` 检查 dispatch、用户优先级与作用域、spawn 导入、精度边界、非连续多维输入、maybe_inplace 语义和原生后备。`tests/test_native_runner.py` 新增 BF16 随机 Llama/Qwen3，检查真实配置已选择新 IR 优先级，保持 CPU HF greedy 和 seed 隔离对照。
 
@@ -558,7 +615,7 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \\
 
 ### SiLU×gate（SwiGLU）
 
-`ops/activation.py` 通过上游 OOT 算子合同执行 SiLU×gate。有匹配 vpipe AOT 产物且满足既有大输入门槛时，选择同一 Torch stream 的 packed SwiGLU；否则使用已安装 MLX v0.32.1 的[编译 `nn.silu`](https://github.com/ml-explore/mlx/blob/3a6219917e4535575ce5bce2fc2ba27a483a709b/python/mlx/nn/layers/activations.py)（MIT）及官方 DLPack bridge。MLX 路径复用 `mx.compile(shapeless=True)`，不接管权重；[已发布 stateless MLP 编译方案](https://github.com/vllm-project/vllm-metal/blob/e7a0c90bec180e5dd4275c473fd7a36e709a930e/vllm_metal/compiled_mlp.py) 的模型专用 wrappers 不采用。这不是 GEMM epilogue 融合。
+`ops/activation.py` 通过上游 OOT 算子合同执行 SiLU×gate。有匹配通用 elementwise AOT 产物且满足既有大输入门槛时，选择同一 Torch stream 的 packed SwiGLU；否则使用已安装 MLX v0.32.1 的[编译 `nn.silu`](https://github.com/ml-explore/mlx/blob/3a6219917e4535575ce5bce2fc2ba27a483a709b/python/mlx/nn/layers/activations.py)（MIT）及官方 DLPack bridge。MLX 路径复用 `mx.compile(shapeless=True)`，不接管权重；[已发布 stateless MLP 编译方案](https://github.com/vllm-project/vllm-metal/blob/e7a0c90bec180e5dd4275c473fd7a36e709a930e/vllm_metal/compiled_mlp.py) 的模型专用 wrappers 不采用。这不是 GEMM epilogue 融合。
 
 通过 vLLM `SiluAndMul.register_oot` 注册通用算子子类，不修改原始类的方法、in-tree operator registry 或模型 registry。OOT 查找使用类名 `SiluAndMul`，配置启停名保留原始 `silu_and_mul`。每个 spawn worker 在加载模型前导入该 provider，导入阶段不初始化 MLX。原生配置以 `none` 禁用其他 CUDA ops，只选择安全的 `+silu_and_mul` 与可选 `+rotary_embedding`；各自显式 opt-out 保留，冲突指令明确报错。普通 worker 或无当前 engine 配置不选择桥接。
 
@@ -574,22 +631,22 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q \
 
 基准预算 64 MiB、系统 headroom 3 GiB；M4 Pro、BF16 32×8192、30 次同步中位数：原生 0.343 / 编译桥接 0.170 ms（2.0×），含 Python OOT dispatch 与双框架同步。小块桥接不稳定，保留原路径；不是模型吞吐或其他机器/形状的加速保证。可选缓存表 NeoX RoPE 的源合同已通过隔离验证，见下节；真实 Higgs/YuE2 和生产负载未在这些路径验收。
 
-### vpipe 通用片段
+### 通用 AOT 算子与来源
 
-固定参考 `tgo-app-dev/vpipe` commit `6a721d5c3b74ded70001f7c02121f14ae8f5321a`，Apache-2.0，源码/适配说明打包为 `_native/VPIPE.md`。采用 elementwise SwiGLU、table-driven partial NeoX RoPE，以及 `rms_norm_fast_f16` 的 per-row SIMD reduction（改编为符合 vLLM 合同的 add-before-norm 双输出）。没有移植模型/codec/视频/quantization，也没有采用会重算频率或使用专用 ring KV 布局的融合。上游有 unit tests，未发现 pinned revision 的公开 GitHub Actions，不宣称全套上游 CI 通过。
+固定参考 `tgo-app-dev/vpipe` commit `6a721d5c3b74ded70001f7c02121f14ae8f5321a`，Apache-2.0，源码/适配说明打包为 `_native/THIRD_PARTY_NOTICES.md`。采用 elementwise SwiGLU、table-driven partial NeoX RoPE，以及 `rms_norm_fast_f16` 的 per-row SIMD reduction（改编为符合 vLLM 合同的 add-before-norm 双输出）。没有移植模型/codec/视频/quantization，也没有采用会重算频率或使用专用 ring KV 布局的融合。上游有 unit tests，未发现 pinned revision 的公开 GitHub Actions，不宣称全套上游 CI 通过。
 
 原版 SwiGLU 只做最终 cast，与 Torch 的中间舍入不等价（FP16/BF16 的257元素判别样例有81/72处差异）；移植先 cast SiLU，再乘 up，并读取连续 packed `[gate,up]`。缓存 NeoX RoPE 同样保留每个乘法的 dtype 舍入，再加减；上游 `cos_sin_cache` 构建、缩放、dtype 匹配和 `index_select` 输入边界校验不变，不重算频率。只注册通用 `RotaryEmbedding` OOT 子类；其他派生 RoPE、GPTJ style、梯度/非连续/其他合法输入保留原生实现，模型映射与原类方法不变。返回新 storage，partial tail 和 query/key 输入保持不变。
 
-`ops/vpipe_kernels.py` 的生产路径仅 `load_metallib`，没有隐式 shader JIT。显式构建需已有 Apple Metal compiler，私有 owned 目录、artifact 校验、flock、临时目录、原子发布与系统 headroom 保持；不安装工具或改变 MPS 水位。缺产物回退，unsafe/corrupt 产物明确报错。本机 `metal` 不可用，**AOT 和真实 worker 新路径仍未验收**。
+`ops/aot_kernels.py` 的生产路径仅 `load_metallib`，没有隐式 shader JIT。显式构建需已有 Apple Metal compiler，私有 owned 目录、artifact 校验、flock、临时目录、原子发布与系统 headroom 保持；不安装工具或改变 MPS 水位。缺产物回退，unsafe/corrupt 产物明确报错。早期本机 `metal` 不可用时，AOT 和真实 worker 新路径尚未验收；后续 P0/P1 记录与[命名切换步骤](installation.md#通用-aot-命名切换)分别说明工具链验收和当前重建要求，不把历史状态当作当前产物状态。
 
 ```bash
-python -I -m vllm_omni_metal.ops.vpipe_kernels
+python -I -m vllm_omni_metal.ops.aot_kernels
 # 只在隔离测试进程显式编译（不是生产/worker JIT）：
-python examples/benchmarks/vpipe.py --compile-for-test --operator rope --rows 4 --require-speedup
-python examples/benchmarks/vpipe.py --compile-for-test --operator silu --rows 1
+python examples/benchmarks/aot_kernels.py --compile-for-test --operator rope --rows 4 --require-speedup
+python examples/benchmarks/aot_kernels.py --compile-for-test --operator silu --rows 1
 ```
 
-测试覆盖三种 dtype、packed rows、257元素精度判别、cache 随机覆盖（不能替换成自算频率）、partial tail、key=None、GPTJ fallback、输入不变、artifact/预算安全。M4 Pro BF16 RoPE 4×hidden4096（head128、Q/KV heads32/8）0.239/0.203ms（1.18×）；单行 width4096 SwiGLU 0.138/0.138ms，无收益，数值片段**不接入默认小 decode**。FP32 attention 4×context2048、Q/KV16/4、head128：gather/bridge/Torch-stream 6.377/0.617/0.597ms（bridge改进1.03×）。基准含最终同步，预算64MiB（vpipe）/256MiB（attention）、headroom3GiB；不能外推模型吞吐。
+测试覆盖三种 dtype、packed rows、257元素精度判别、cache 随机覆盖（不能替换成自算频率）、partial tail、key=None、GPTJ fallback、输入不变、artifact/预算安全。M4 Pro BF16 RoPE 4×hidden4096（head128、Q/KV heads32/8）0.239/0.203ms（1.18×）；单行 width4096 SwiGLU 0.138/0.138ms，无收益，数值片段**不接入默认小 decode**。FP32 attention 4×context2048、Q/KV16/4、head128：gather/bridge/Torch-stream 6.377/0.617/0.597ms（bridge改进1.03×）。基准含最终同步，预算64MiB（elementwise）/256MiB（attention）、headroom3GiB；不能外推模型吞吐。
 
 add-before-norm 单 kernel 已完成数值及显式测试 worker 验证，但不是原样采用语义不同的 vpipe `rms_add`。GEMM+SwiGLU 仍缺合法的跨算子接入：linear OOT 不知道下一步 activation，SiluAndMul OOT 拿不到原输入与投影权重；vpipe 原实现另有交错布局和省略中间舍入的问题。QK norm+RoPE+KV 的上游 backend 合同存在，但 MPS 图融合 pass 未开放，当前 eager attention 入口拿不到 positions/cache/norm weights；不能以未命中的方法宣称完成。ModelScope 本地有 Higgs/YuE2 权重候选，HF 对应缺失不能概括全部缓存；本轮未做全量权重完整性校验，也未完成这些模型的新路径验收。
 
@@ -597,9 +654,9 @@ add-before-norm 单 kernel 已完成数值及显式测试 worker 验证，但不
 
 采用 [vllm-metal `f2e26b3` 的融合 RoPE](https://github.com/vllm-project/vllm-metal/blob/f2e26b342c93d6c705ebee0950a0baf8025ee46d/vllm_metal/metal/kernels_v2/rope.metal)（Apache-2.0）：Q/K 共用一次 dispatch，每线程旋转一对元素，直接写新输出，省去原先两次 clone、两次旋转及 cos/sin FP32 转换。仍先通过 Torch `index_select` 校验并收集上游缓存，不在 shader 中直接使用未校验 positions。每个乘法先舍入到输入 dtype，再加减；FP16/BF16、GQA、修改后的缓存及输入不变已逐位验证。仅完整 NeoX、同时有 Q/K 时采用；partial、FP32、key=None 仍走既有实现。没有扩大支持范围，没有融合 projection/QK norm/KV 写入。
 
-本轮有界检索排除了图形/游戏/语言运行时；只细读 vllm-metal 与 [MLX RMSNorm](https://github.com/ml-explore/mlx/blob/36969c094354086e15d2a327a9c50feb20b9cf11/mlx/backend/metal/kernels/rms_norm.metal)（MIT）。两项目均有活跃维护和 CI。MLX 的 FP32 SIMD 归约与当前 Torch/vpipe norm 重复，未再引入桥接或第二套运行时；MRv2 输入兼容替换、模型专用融合、量化和 M5 NAX 不属于本次合法加速落点。不是穷尽所有 Metal 项目的结论。
+本轮有界检索排除了图形/游戏/语言运行时；只细读 vllm-metal 与 [MLX RMSNorm](https://github.com/ml-explore/mlx/blob/36969c094354086e15d2a327a9c50feb20b9cf11/mlx/backend/metal/kernels/rms_norm.metal)（MIT）。两项目均有活跃维护和 CI。MLX 的 FP32 SIMD 归约与当前 Torch／通用 elementwise norm 重复，未再引入桥接或第二套运行时；MRv2 输入兼容替换、模型专用融合、量化和 M5 NAX 不属于本次合法加速落点。不是穷尽所有 Metal 项目的结论。
 
-M4 Pro，Q/KV heads32/8、head128、hidden4096；现有 `examples/benchmarks/vpipe.py` 的 **30 次逐调用同步中位数**，包含 OOT dispatch、缓存选择和同步：
+M4 Pro，Q/KV heads32/8、head128、hidden4096；现有基准（当前入口 `examples/benchmarks/aot_kernels.py`）历史测量的 **30 次逐调用同步中位数**，包含 OOT dispatch、缓存选择和同步：
 
 | dtype / rows | 上游 native（ms） | packed Q/K OOT（ms） | 耗时比 |
 | --- | ---: | ---: | ---: |
@@ -607,13 +664,13 @@ M4 Pro，Q/KV heads32/8、head128、hidden4096；现有 `examples/benchmarks/vpi
 | FP16 / 1 | 0.2191 | 0.1449 | 1.51× |
 
 ```bash
-python examples/benchmarks/vpipe.py --compile-for-test --operator rope --rows 32 --dtype bfloat16 --require-speedup
-python examples/benchmarks/vpipe.py --compile-for-test --operator rope --rows 1 --dtype float16 --require-speedup
+python examples/benchmarks/aot_kernels.py --compile-for-test --operator rope --rows 32 --dtype bfloat16 --require-speedup
+python examples/benchmarks/aot_kernels.py --compile-for-test --operator rope --rows 1 --dtype float16 --require-speedup
 ```
 
 另存 `outputs/metal-packed-rope-current/report.json`：对上一版 separate-Q/K shader 做交错 7 轮、每轮100次异步调用后同步的隔离 A/B；6个 dtype/rows 组合均逐位等于 Torch，测得1.81–3.29×，有负载波动。计时口径不同，不能与上表混算。
 
-**以上均为显式测试编译，不是生产 AOT 或 YuE2 新增整模型收益。** 生产仍只加载显式 metallib；本机缺 Metal compiler，默认 worker 不会命中新融合。新增源码随 wheel、源码安装及 Formula 一并分发，不自动装工具，不在启动/请求 JIT。
+**以上均为历史显式测试编译，不是生产 AOT 或 YuE2 新增整模型收益。** 生产仍只加载显式 metallib；当时缺 Metal compiler，默认 worker 不会命中新融合。后续 P0/P1 及命名切换的匹配产物须按各自记录区分，不沿用当时状态。源码随 wheel、源码安装及 Formula 一并分发，不自动装工具，不在启动/请求 JIT。
 
 ### 2026-10-15 逐项实测
 

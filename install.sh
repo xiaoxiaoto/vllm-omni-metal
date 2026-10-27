@@ -19,7 +19,7 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
 fi
 venv="${source_dir:-$HOME}/.venv-vllm-omni-metal"
 with_mps_attention=false
-with_vpipe=false
+with_aot_kernels=false
 with_ane=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,16 +27,16 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo '--venv 需要路径' >&2; exit 1; }
       venv="$2"; shift 2 ;;
     --with-mps-attention) with_mps_attention=true; shift ;;
-    --with-vpipe) with_vpipe=true; shift ;;
+    --with-aot-kernels) with_aot_kernels=true; shift ;;
     --with-ane) with_ane=true; shift ;;
     -h|--help)
-      printf '%s\n' '用法：install.sh [--venv PATH] [--with-mps-attention] [--with-vpipe] [--with-ane]' \
+      printf '%s\n' '用法：install.sh [--venv PATH] [--with-mps-attention] [--with-aot-kernels] [--with-ane]' \
         '安装 vLLM CPU / vllm-metal 0.32.0 官方 wheel、Omni CPU 包和本插件。' \
         '源码运行默认创建 .venv-vllm-omni-metal（editable）；curl 运行创建 ~/.venv-vllm-omni-metal。' \
         '不修改系统 Python、Homebrew libexec、已有 .venv 或运行中的服务。' \
         '默认不编译可选工具；所有显式构建均在选定私有 Python 安装完成后离线执行。' \
         '--with-mps-attention 构建并验证 Torch-stream attention host launcher，需要现有 Apple Command Line Tools。' \
-        '--with-vpipe 构建 vpipe metallib，需要已安装的 Apple Metal compiler。' \
+        '--with-aot-kernels 构建通用 elementwise/diffusion metallib，需要已安装的 Apple Metal compiler。' \
         '--with-ane 构建 CoreML host 工具；不代表 ANE 或模型已可用。' \
         '以上构建不下载工具/权重，不自动转换模型或校准；失败即退出，不重启服务。'
       exit 0 ;;
@@ -102,7 +102,7 @@ from importlib.resources import files
 for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector',
                'native.attention', 'native.compat', 'native.runner', 'native.worker',
                'diffusion.attention', 'diffusion.config', 'diffusion.ops', 'diffusion.worker',
-               'ops.mps_attention', 'ops.metal_attention', 'ops.vpipe_kernels',
+               'ops.mps_attention', 'ops.metal_attention', 'ops.aot_kernels',
                'ops.normalization', 'ops.activation', 'ops.rotary',
                'quantization.linear', 'quantization.engine',
                'quantization.capture', 'quantization.adapter', 'quantization.runtime',
@@ -129,6 +129,27 @@ assert validate_profile(
     quantization_profile, quantization_modules, scope='installation-contract-v2',
 ) == list(quantization_modules)
 # End CPU-only profile contract.
+# CPU-only fused diffusion contract; no Metal build or model execution.
+from vllm_omni_metal.diffusion.ops import gated_residual_rms_adaln, qk_norm_rotary
+activation = torch.ones(1, 2, 4)
+normalized, residual = gated_residual_rms_adaln(
+    activation, activation, torch.ones(4), torch.ones(4),
+    torch.zeros(4), torch.zeros(4), 0.0,
+)
+torch.testing.assert_close(normalized, activation, atol=0, rtol=0)
+torch.testing.assert_close(residual, 2 * activation, atol=0, rtol=0)
+query = torch.ones(1, 1, 2, 4)
+key = -torch.ones(1, 1, 1, 4)
+rotated_q, rotated_k = qk_norm_rotary(
+    query, key, None, None, torch.full((1, 2), 1j, dtype=torch.complex64), 0.0, 0.0,
+)
+torch.testing.assert_close(
+    rotated_q, torch.tensor([-1., 1., -1., 1.]).expand_as(query), atol=0, rtol=0,
+)
+torch.testing.assert_close(
+    rotated_k, torch.tensor([1., -1., 1., -1.]).expand_as(key), atol=0, rtol=0,
+)
+# End CPU-only fused diffusion contract.
 from vllm_omni_metal.platform import MetalOmniPlatform
 for path in (
     MetalOmniPlatform.get_omni_ar_worker_cls(),
@@ -143,9 +164,9 @@ for resource in (
     '_native/pytorch_backend/mps_ops.mm',
     '_native/metal/metal_device.h',
     '_native/metal/paged_attention_kernels.h',
-    '_native/vpipe_elementwise.metal',
+    '_native/elementwise.metal',
     '_native/diffusion_rotary.metal',
-    '_native/VPIPE.md',
+    '_native/THIRD_PARTY_NOTICES.md',
     '_native/ane/ane-emitter.cc',
     '_native/ane/ane-emitter.h',
     '_native/ane/emit.cc',
@@ -166,12 +187,12 @@ if [[ "$with_mps_attention" == true ]]; then
   "$python" -I -m vllm_omni_metal.ops.mps_attention
   "$python" -I -c 'from vllm_omni_metal.ops.mps_attention import get_mps_ops; assert get_mps_ops() is not None, "Torch-stream attention launcher 未加载"'
 fi
-if [[ "$with_vpipe" == true ]]; then
-  "$python" -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion
+if [[ "$with_aot_kernels" == true ]]; then
+  "$python" -I -m vllm_omni_metal.ops.aot_kernels --diffusion
 fi
 if [[ "$with_ane" == true ]]; then
   "$python" -I -m vllm_omni_metal.ane.build --bridge
 fi
-printf '\n可选工具仅显式离线准备；分别使用当前环境：\n  "%s" -I -m vllm_omni_metal.ops.mps_attention\n  "%s" -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion\n  "%s" -I -m vllm_omni_metal.ane.build --bridge\n启动和请求期间不编译，不自动安装工具、下载权重、转换模型或校准。\n' "$python" "$python" "$python"
+printf '\n可选工具仅显式离线准备；分别使用当前环境：\n  "%s" -I -m vllm_omni_metal.ops.mps_attention\n  "%s" -I -m vllm_omni_metal.ops.aot_kernels --diffusion\n  "%s" -I -m vllm_omni_metal.ane.build --bridge\n启动和请求期间不编译，不自动安装工具、下载权重、转换模型或校准。\n' "$python" "$python" "$python"
 printf '\nANE auto 无匹配权重图/整流水线批准 profile 时保留 GPU；host 工具不等于 ANE 可用。\n真实 YuE2 ANE 图 relative L2=5.499%% 超过 1%% 门槛，已拒绝，未批准 ANE。\nYuE2 实测依赖独立模型 overlay；通用安装不捆绑模型补丁/registry/媒体，不保证未补丁 Omni 可运行 YuE2。\n未修改其他环境或重启已有服务；维护已有环境前请先停止使用它的服务。\n'
 printf '\n安装完成。激活环境：\n  source "%s/bin/activate"\n或直接运行：\n  "%s/bin/vllm-omni" serve /path/to/model --omni --deploy-config /path/to/metal-profile.yaml\n' "$venv" "$venv"

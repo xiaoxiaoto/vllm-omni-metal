@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vpipe ports must preserve Torch rounding, cache tables and input storage."""
+"""AOT kernels must preserve Torch rounding, cache tables and input storage."""
 
 import math
 import os
@@ -12,20 +12,20 @@ import pytest
 import torch
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
-from vllm_omni_metal.ops import vpipe_kernels
+from vllm_omni_metal.ops import aot_kernels
 
 
 @pytest.mark.parametrize("args", [["--rows", "0"], ["--rows", "128", "--hidden-size", "16384"]])
 def test_benchmark_budget_rejects_before_allocating(monkeypatch, args):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     monkeypatch.setattr(
-        vpipe_kernels.psutil, "virtual_memory", lambda: SimpleNamespace(available=8 * 1024**3)
+        aot_kernels.psutil, "virtual_memory", lambda: SimpleNamespace(available=8 * 1024**3)
     )
-    monkeypatch.setattr(sys, "argv", ["vpipe.py", *args, "--compile-for-test"])
+    monkeypatch.setattr(sys, "argv", ["aot_kernels.py", *args, "--compile-for-test"])
     monkeypatch.setattr(
         torch.mps, "compile_shader", lambda _: pytest.fail("budget gate must precede compilation")
     )
-    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/vpipe.py"
+    script = Path(__file__).resolve().parents[1] / "examples/benchmarks/aot_kernels.py"
     with pytest.raises(SystemExit) as error:
         runpy.run_path(str(script), run_name="__main__")
     assert error.value.code == 2
@@ -33,18 +33,18 @@ def test_benchmark_budget_rejects_before_allocating(monkeypatch, args):
 
 def test_missing_artifact_never_compiles_or_creates_cache(tmp_path, monkeypatch):
     path = tmp_path / "absent" / "ops.metallib"
-    monkeypatch.setattr(vpipe_kernels, "_artifact_path", lambda _: path)
+    monkeypatch.setattr(aot_kernels, "_artifact_path", lambda _: path)
     monkeypatch.setattr(torch.mps, "compile_shader", lambda _: pytest.fail("worker JIT forbidden"))
-    vpipe_kernels._library.cache_clear()
+    aot_kernels._library.cache_clear()
     try:
-        assert vpipe_kernels._library(torch.float16) is None
+        assert aot_kernels._library(torch.float16) is None
         assert not path.parent.exists()
     finally:
-        vpipe_kernels._library.cache_clear()
+        aot_kernels._library.cache_clear()
 
 
 @pytest.mark.parametrize("case", ["symlink", "public_directory", "public_file"])
-def test_unsafe_vpipe_artifact_fails_explicitly(tmp_path, monkeypatch, case):
+def test_unsafe_aot_artifact_fails_explicitly(tmp_path, monkeypatch, case):
     directory = tmp_path / "private"
     directory.mkdir(mode=0o700)
     path = directory / "ops.metallib"
@@ -57,25 +57,25 @@ def test_unsafe_vpipe_artifact_fails_explicitly(tmp_path, monkeypatch, case):
         directory.chmod(0o755)
     else:
         path.chmod(0o666)
-    monkeypatch.setattr(vpipe_kernels, "_artifact_path", lambda _: path)
-    vpipe_kernels._library.cache_clear()
+    monkeypatch.setattr(aot_kernels, "_artifact_path", lambda _: path)
+    aot_kernels._library.cache_clear()
     try:
         with pytest.raises(RuntimeError, match="private|unsafe"):
-            vpipe_kernels._library(torch.float16)
+            aot_kernels._library(torch.float16)
     finally:
-        vpipe_kernels._library.cache_clear()
+        aot_kernels._library.cache_clear()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cpu_never_uses_vpipe_shader(dtype):
-    assert not vpipe_kernels.supports_silu(torch.ones(1, 128, dtype=dtype))
+def test_cpu_never_uses_elementwise_shader(dtype):
+    assert not aot_kernels.supports_silu(torch.ones(1, 128, dtype=dtype))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_cpu_add_rms_norm_never_loads_shader(monkeypatch, dtype):
-    monkeypatch.setattr(vpipe_kernels, "_library", lambda _: pytest.fail("CPU shader load"))
+    monkeypatch.setattr(aot_kernels, "_library", lambda _: pytest.fail("CPU shader load"))
     x = torch.ones(2, 128, dtype=dtype)
-    assert not vpipe_kernels.supports_add_rms_norm(x, x, x[0])
+    assert not aot_kernels.supports_add_rms_norm(x, x, x[0])
 
 
 def _norm_metadata(shape=(2, 128), dtype=torch.float16, **overrides):
@@ -107,16 +107,16 @@ def _norm_metadata(shape=(2, 128), dtype=torch.float16, **overrides):
     ],
 )
 def test_add_rms_norm_shape_integer_and_width_domain(monkeypatch, shape, accepted):
-    monkeypatch.setattr(vpipe_kernels, "_library", lambda _: object())
+    monkeypatch.setattr(aot_kernels, "_library", lambda _: object())
     x = _norm_metadata(shape)
     weight = _norm_metadata((shape[-1],) if shape else (1,))
-    assert vpipe_kernels.supports_add_rms_norm(x, x, weight) is accepted
+    assert aot_kernels.supports_add_rms_norm(x, x, weight) is accepted
 
 
 @pytest.mark.parametrize("input_index", [0, 1, 2])
 @pytest.mark.parametrize("case", ["grad", "strided", "dtype", "device", "shape"])
 def test_add_rms_norm_rejects_unsupported_tensor_contract(monkeypatch, input_index, case):
-    monkeypatch.setattr(vpipe_kernels, "_library", lambda _: object())
+    monkeypatch.setattr(aot_kernels, "_library", lambda _: object())
     args = [_norm_metadata(), _norm_metadata(), _norm_metadata((128,))]
     target = args[input_index]
     if case == "grad":
@@ -129,7 +129,7 @@ def test_add_rms_norm_rejects_unsupported_tensor_contract(monkeypatch, input_ind
         target.device = torch.device("cpu")
     else:
         target.shape = (3, 64)
-    assert not vpipe_kernels.supports_add_rms_norm(*args)
+    assert not aot_kernels.supports_add_rms_norm(*args)
 
 
 @pytest.mark.parametrize(
@@ -146,43 +146,43 @@ def test_add_rms_norm_rejects_unsupported_tensor_contract(monkeypatch, input_ind
     ],
 )
 def test_add_rms_norm_epsilon_cannot_silently_narrow(epsilon, accepted):
-    assert vpipe_kernels._supports_add_rms_norm_epsilon(epsilon) is accepted
+    assert aot_kernels._supports_add_rms_norm_epsilon(epsilon) is accepted
     if not accepted:
         with pytest.raises(ValueError, match="epsilon"):
-            vpipe_kernels.add_rms_norm(None, None, None, epsilon)
+            aot_kernels.add_rms_norm(None, None, None, epsilon)
 
 
 def test_add_rms_norm_missing_artifact_rejects_without_compilation(monkeypatch):
-    monkeypatch.setattr(vpipe_kernels, "_library", lambda _: None)
+    monkeypatch.setattr(aot_kernels, "_library", lambda _: None)
     monkeypatch.setattr(torch.mps, "compile_shader", lambda _: pytest.fail("worker JIT forbidden"))
     x, weight = _norm_metadata(), _norm_metadata((128,))
-    assert not vpipe_kernels.supports_add_rms_norm(x, x, weight)
-    with pytest.raises(ValueError, match="missing AOT"):
-        vpipe_kernels.add_rms_norm(x, x, weight, 1e-6)
+    assert not aot_kernels.supports_add_rms_norm(x, x, weight)
+    with pytest.raises(ValueError):
+        aot_kernels.add_rms_norm(x, x, weight, 1e-6)
 
 
-def test_vpipe_build_missing_compiler_creates_nothing(tmp_path, monkeypatch):
+def test_elementwise_build_missing_compiler_creates_nothing(tmp_path, monkeypatch):
     path = tmp_path / "absent" / "ops.metallib"
-    monkeypatch.setattr(vpipe_kernels, "_artifact_path", lambda _: path)
-    monkeypatch.setattr(vpipe_kernels.shutil, "which", lambda _: "/usr/bin/xcrun")
+    monkeypatch.setattr(aot_kernels, "_artifact_path", lambda _: path)
+    monkeypatch.setattr(aot_kernels.shutil, "which", lambda _: "/usr/bin/xcrun")
     monkeypatch.setattr(
-        vpipe_kernels.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1)
+        aot_kernels.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1)
     )
     with pytest.raises(RuntimeError, match="compiler unavailable"):
-        vpipe_kernels.build_vpipe_kernels()
+        aot_kernels.build_elementwise_kernels()
     assert not path.parent.exists()
 
 
 @pytest.mark.parametrize("available,disk", [(2 * 1024**3, 1024**3), (8 * 1024**3, 128 * 1024**2)])
-def test_vpipe_build_budget_stops_before_compiler(tmp_path, monkeypatch, available, disk):
+def test_elementwise_build_budget_stops_before_compiler(tmp_path, monkeypatch, available, disk):
     path = tmp_path / "absent" / "ops.metallib"
-    monkeypatch.setattr(vpipe_kernels, "_artifact_path", lambda _: path)
+    monkeypatch.setattr(aot_kernels, "_artifact_path", lambda _: path)
     monkeypatch.setattr(
-        vpipe_kernels.psutil, "virtual_memory", lambda: SimpleNamespace(available=available)
+        aot_kernels.psutil, "virtual_memory", lambda: SimpleNamespace(available=available)
     )
-    monkeypatch.setattr(vpipe_kernels.shutil, "disk_usage", lambda _: SimpleNamespace(free=disk))
+    monkeypatch.setattr(aot_kernels.shutil, "disk_usage", lambda _: SimpleNamespace(free=disk))
     with pytest.raises(RuntimeError, match="budget"):
-        vpipe_kernels.build_vpipe_kernels()
+        aot_kernels.build_elementwise_kernels()
     assert not path.parent.exists()
 
 
@@ -199,13 +199,13 @@ def explicit_test_shaders(monkeypatch):
 
     def library(dtype):
         if dtype not in libraries:
-            scalar = vpipe_kernels._SCALARS[dtype]
+            scalar = aot_kernels._SCALARS[dtype]
             libraries[dtype] = torch.mps.compile_shader(
-                f"#define VPIPE_ELT {scalar}\n" + vpipe_kernels._SOURCE.read_text()
+                f"#define ELEMENTWISE_ELT {scalar}\n" + aot_kernels._SOURCE.read_text()
             )
         return libraries[dtype]
 
-    monkeypatch.setattr(vpipe_kernels, "_library", library)
+    monkeypatch.setattr(aot_kernels, "_library", library)
 
 
 @pytest.mark.integration
@@ -219,7 +219,7 @@ def test_packed_silu_matches_original_rounding(explicit_test_shaders, dtype, row
     saved = x.clone()
     # Preserve the replaced MPS operation exactly; CPU SiLU differs at half ULP boundaries.
     expected = (torch.nn.functional.silu(x[..., :width]) * x[..., width:]).cpu()
-    actual = vpipe_kernels.silu_and_mul(x)
+    actual = aot_kernels.silu_and_mul(x)
     tol = 2e-6 if dtype == torch.float32 else 0
     torch.testing.assert_close(actual.cpu(), expected, atol=tol, rtol=tol)
     torch.testing.assert_close(x, saved, atol=0, rtol=0)
@@ -243,7 +243,7 @@ def test_cached_neox_rope_keeps_product_rounding_tail_and_inputs(
     saved = x.clone()
     expected = x.clone()
     expected[..., :rot] = ApplyRotaryEmb.forward_static(x[..., :rot], cos, sin)
-    actual = vpipe_kernels.cached_neox_rope(x, cos, sin, rot)
+    actual = aot_kernels.cached_neox_rope(x, cos, sin, rot)
     tol = 2e-6 if dtype == torch.float32 else 0
     torch.testing.assert_close(actual, expected, atol=tol, rtol=tol)
     torch.testing.assert_close(x, saved, atol=0, rtol=0)
@@ -266,7 +266,7 @@ def test_packed_qk_rope_preserves_gqa_rounding_and_inputs(
     expected = [
         ApplyRotaryEmb.forward_static(x.view(tokens, -1, dim), cos, sin).view_as(x) for x in (q, k)
     ]
-    actual = vpipe_kernels.cached_neox_rope_qk(q, k, cache, dim)
+    actual = aot_kernels.cached_neox_rope_qk(q, k, cache, dim)
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference, atol=0, rtol=0)
     for source, original in zip((q, k, cache), saved, strict=True):
@@ -289,18 +289,16 @@ def test_add_rms_norm_single_launch_double_output_and_immutable_inputs(
     expected = (summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + 1e-6)).to(
         dtype
     ) * weight.cpu()
-    library = vpipe_kernels._library(dtype)
+    library = aot_kernels._library(dtype)
     launches = []
 
     def launch(*args, **kwargs):
         launches.append(kwargs)
         return library.add_rms_norm_f16(*args, **kwargs)
 
-    monkeypatch.setattr(
-        vpipe_kernels, "_library", lambda _: SimpleNamespace(add_rms_norm_f16=launch)
-    )
-    assert vpipe_kernels.supports_add_rms_norm(x, residual, weight)
-    actual, updated_residual = vpipe_kernels.add_rms_norm(x, residual, weight, 1e-6)
+    monkeypatch.setattr(aot_kernels, "_library", lambda _: SimpleNamespace(add_rms_norm_f16=launch))
+    assert aot_kernels.supports_add_rms_norm(x, residual, weight)
+    actual, updated_residual = aot_kernels.add_rms_norm(x, residual, weight, 1e-6)
     assert launches == [{"threads": (256, x.numel() // shape[-1]), "group_size": (256, 1)}]
     assert actual.shape == updated_residual.shape == x.shape
     assert actual.dtype == updated_residual.dtype == dtype

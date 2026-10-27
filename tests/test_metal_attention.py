@@ -156,3 +156,68 @@ def test_metal_paged_attention_large_logits_and_noncontiguous_inputs():
     expected = torch.stack([v[0, 0], v[:, 0].mean(0)]).unsqueeze(1).expand_as(actual)
     torch.testing.assert_close(actual, expected)
     assert torch.isfinite(actual).all()
+
+
+def test_native_split_workspace_shape_replay_preserves_held_results(monkeypatch):
+    from vllm_omni_metal.ops.mps_attention import get_mps_ops
+
+    if get_mps_ops() is None:
+        pytest.skip("optional launcher has not been explicitly built")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("workspace reuse must not wait for the GPU")
+
+    torch.manual_seed(59)
+    held = []
+    configurations = [
+        (1, 4, 64, 513, torch.float32),
+        (2, 4, 96, 1025, torch.float16),
+        (1, 4, 96, 257, torch.float16),
+        (2, 4, 96, 1025, torch.float16),
+        (1, 8, 64, 769, torch.bfloat16),
+        (1, 4, 64, 513, torch.float32),
+    ]
+    with monkeypatch.context() as scoped:
+        scoped.setattr(torch.mps, "synchronize", forbidden)
+        for rows, heads, dim, length, dtype in configurations:
+            kv_heads, block_size = 2, 16
+            pages = (length + block_size - 1) // block_size
+            # Each row is a separate decode request; all lengths force partitioning.
+            keys = torch.randn(rows, pages * block_size, kv_heads, dim).to(dtype)
+            values = torch.randn_like(keys)
+            q = torch.randn(rows, heads, dim).to(dtype)
+            cache = torch.empty(
+                2, rows * pages, block_size, kv_heads, dim, dtype=dtype, device="mps"
+            )
+            cache[0].copy_(keys.reshape_as(cache[0]))
+            cache[1].copy_(values.reshape_as(cache[1]))
+            expected = []
+            for row in range(rows):
+                head_values = []
+                for head in range(heads):
+                    kv_head = head // (heads // kv_heads)
+                    scores = keys[row, :length, kv_head].double() @ q[row, head].double()
+                    head_values.append(
+                        (scores * dim**-0.5).softmax(0) @ values[row, :length, kv_head].double()
+                    )
+                expected.append(torch.stack(head_values))
+            meta = MetalAttentionMetadata(
+                list(range(rows + 1)),
+                [length] * rows,
+                [list(range(row * pages, (row + 1) * pages)) for row in range(rows)],
+            )
+            impl = MetalAttentionImpl(heads, dim, dim**-0.5, kv_heads)
+            actual = impl.forward(
+                None,
+                q.to("mps"),
+                keys[:, length - 1].to("mps"),
+                values[:, length - 1].to("mps"),
+                cache,
+                meta,
+            )
+            # Do not read/clone a returned result until all subsequent calls have
+            # been enqueued: accidental output caching must not hide behind waits.
+            held.append((actual, torch.stack(expected).reshape(rows, -1).to(dtype)))
+    for actual, expected in held:
+        tolerance = {torch.float32: 2e-5, torch.float16: 2e-3, torch.bfloat16: 2e-2}[actual.dtype]
+        torch.testing.assert_close(actual.cpu(), expected, atol=tolerance, rtol=tolerance)

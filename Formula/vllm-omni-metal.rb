@@ -71,11 +71,11 @@ class VllmOmniMetal < Formula
       Prepare them explicitly with this libexec Python after installation:
         #{libexec}/bin/python -I -m vllm_omni_metal.ops.mps_attention
         #{libexec}/bin/python -I -c 'from vllm_omni_metal.ops.mps_attention import get_mps_ops; assert get_mps_ops() is not None'
-        #{libexec}/bin/python -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion
+        #{libexec}/bin/python -I -m vllm_omni_metal.ops.aot_kernels --diffusion
         #{libexec}/bin/python -I -m vllm_omni_metal.ane.build --bridge
       Attention and ANE host tools require existing Apple Command Line Tools.
-      vpipe additionally requires an installed Apple Metal compiler; no tools
-      are downloaded automatically. Missing vpipe compiler is not an install failure.
+      AOT kernels additionally require an installed Apple Metal compiler; no tools
+      are downloaded automatically. A missing Metal compiler is not an install failure.
       No startup/request compilation, model downloads, conversion, or calibration.
 
       ANE auto keeps GPU without approved weights and a whole-pipeline profile.
@@ -104,7 +104,7 @@ class VllmOmniMetal < Formula
       for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector',
                      'native.attention', 'native.compat', 'native.runner', 'native.worker',
                      'diffusion.attention', 'diffusion.config', 'diffusion.ops', 'diffusion.worker',
-                     'ops.mps_attention', 'ops.metal_attention', 'ops.vpipe_kernels',
+                     'ops.mps_attention', 'ops.metal_attention', 'ops.aot_kernels',
                      'ops.normalization', 'ops.activation', 'ops.rotary',
                      'quantization.linear', 'quantization.engine',
                      'quantization.capture', 'quantization.adapter', 'quantization.runtime',
@@ -131,6 +131,27 @@ class VllmOmniMetal < Formula
           quantization_profile, quantization_modules, scope='installation-contract-v2',
       ) == list(quantization_modules)
       # End CPU-only profile contract.
+      # CPU-only fused diffusion contract; no Metal build or model execution.
+      from vllm_omni_metal.diffusion.ops import gated_residual_rms_adaln, qk_norm_rotary
+      activation = torch.ones(1, 2, 4)
+      normalized, residual = gated_residual_rms_adaln(
+          activation, activation, torch.ones(4), torch.ones(4),
+          torch.zeros(4), torch.zeros(4), 0.0,
+      )
+      torch.testing.assert_close(normalized, activation, atol=0, rtol=0)
+      torch.testing.assert_close(residual, 2 * activation, atol=0, rtol=0)
+      query = torch.ones(1, 1, 2, 4)
+      key = -torch.ones(1, 1, 1, 4)
+      rotated_q, rotated_k = qk_norm_rotary(
+          query, key, None, None, torch.full((1, 2), 1j, dtype=torch.complex64), 0.0, 0.0,
+      )
+      torch.testing.assert_close(
+          rotated_q, torch.tensor([-1., 1., -1., 1.]).expand_as(query), atol=0, rtol=0,
+      )
+      torch.testing.assert_close(
+          rotated_k, torch.tensor([1., -1., 1., -1.]).expand_as(key), atol=0, rtol=0,
+      )
+      # End CPU-only fused diffusion contract.
       from vllm_omni_metal.platform import MetalOmniPlatform
       for path in (
           MetalOmniPlatform.get_omni_ar_worker_cls(),
@@ -145,9 +166,9 @@ class VllmOmniMetal < Formula
           '_native/pytorch_backend/mps_ops.mm',
           '_native/metal/metal_device.h',
           '_native/metal/paged_attention_kernels.h',
-          '_native/vpipe_elementwise.metal',
+          '_native/elementwise.metal',
           '_native/diffusion_rotary.metal',
-          '_native/VPIPE.md',
+          '_native/THIRD_PARTY_NOTICES.md',
           '_native/ane/ane-emitter.cc',
           '_native/ane/ane-emitter.h',
           '_native/ane/emit.cc',
@@ -165,7 +186,7 @@ class VllmOmniMetal < Formula
                  for e in entry_points(group='vllm_omni.platform_plugins'))
     PYTHON
     system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ops.mps_attention", "--help"
-    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ops.vpipe_kernels", "--help"
+    system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ops.aot_kernels", "--help"
     system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ane.build", "--help"
     system libexec/"bin/python", "-I", "-m", "vllm_omni_metal.ane.projection", "--help"
     system libexec/"bin/python", "-I", bin/"vllm-omni", "--help"

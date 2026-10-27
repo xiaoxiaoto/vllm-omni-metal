@@ -1,4 +1,4 @@
-# vpipe generic elementwise ports
+# Third-party implementation notices
 
 Source: <https://github.com/tgo-app-dev/vpipe/tree/6a721d5c3b74ded70001f7c02121f14ae8f5321a>
 
@@ -11,7 +11,7 @@ adapted under `_native/ane/`; its manager-dependent self-test was removed and th
 C ABI/host tool owns integrity checks. No bundled media/model components,
 MLX steel headers, GPL libraries, or model-specific fusions are copied.
 
-`vpipe_elementwise.metal` is **adapted**, not an unchanged source snapshot:
+`elementwise.metal` is **adapted**, not an unchanged source snapshot:
 
 - SwiGLU: packed `[gate, up]` row indexing; SiLU casts to the input dtype before
   multiplying up, as vLLM's Torch operator does. The original final-only cast fails
@@ -28,7 +28,7 @@ MLX steel headers, GPL libraries, or model-specific fusions are copied.
 Additional packed Q/K RoPE source:
 <https://github.com/vllm-project/vllm-metal/blob/f2e26b342c93d6c705ebee0950a0baf8025ee46d/vllm_metal/metal/kernels_v2/rope.metal>
 (Apache-2.0). `rope_qk_cached` keeps its one-thread-per-pair, combined-Q/K
-dispatch and separate product rounding. Adaptations: `VPIPE_ELT` specialization,
+dispatch and separate product rounding. Adaptations: `ELEMENTWISE_ELT` specialization,
 contiguous input rows, and Torch-validated/gathered cache rows instead of unchecked
 shader position indexing. Only full-dimension FP16/BF16 NeoX with both Q/K selects
 this path; partial rotation, FP32 and key-less calls retain the existing kernel.
@@ -41,7 +41,7 @@ this is not a claim that all vpipe kernels or upstream CI passed.
 
 Local tests compile isolated shaders explicitly. Production workers **only load**
 private prebuilt `.metallib` artifacts. Run
-`python -I -m vllm_omni_metal.ops.vpipe_kernels` explicitly to build using an already
+`python -I -m vllm_omni_metal.ops.aot_kernels` explicitly to build using an already
 installed Apple Metal compiler. No compiler/tool download or worker JIT fallback.
 Missing artifacts retain the original paths; invalid artifacts fail explicitly.
 

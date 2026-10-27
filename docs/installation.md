@@ -27,7 +27,7 @@
 
 顶层 `platform.py` 和 `vllm_omni_metal:register_platform` entry point 不变，依赖 pins 不变；所有 native 资源仍位于包根的 `_native/`，不移入功能包。源码安装和 curl 安装共用 `install.sh` 的新模块检查与显式构建路径，Formula 使用相同路径；校验覆盖五个功能包的全部21个迁移模块，并实际解析AR、generation、diffusion worker、diffusion runner及SDPA backend类路径，同时检查native源码与许可证。继续使用所选解释器的 `-I` 隔离模式，不加载模型或构建可选产物。
 
-切换前停止使用目标环境的服务；从本次源码重新构建并安装非 editable wheel（editable 环境也须重新安装当前源码），让外部适配器一起迁移。源码指纹变化后重新构建隔离后端与所需的 MPS host launcher、vpipe metallib、ANE host/权重图缓存，并重新准备对应校准/profile；不要复用旧 wheel、ready 标记或把旧缓存当作新路径已可用的证据。不删除模型缓存或接管其他环境。
+切换前停止使用目标环境的服务；从本次源码重新构建并安装非 editable wheel（editable 环境也须重新安装当前源码），让外部适配器一起迁移。源码指纹变化后重新构建隔离后端与所需的 MPS host launcher、通用 AOT metallib、ANE host/权重图缓存，并重新准备对应校准/profile；不要复用旧 wheel、ready 标记或把旧缓存当作新路径已可用的证据。不删除模型缓存或接管其他环境。
 
 本次分包验证：`.venv-vllm-omni-metal/bin/python -m pytest -q -m 'not integration'` 为479项通过、207项未选择；相邻部署 `python -m unittest discover -s ../docker-compose/yue2-3b -p test_prepare_ane.py -v` 为11项通过。Ruff检查、`bash -n install.sh`、`ruby -c Formula/vllm-omni-metal.rb` 和相邻YuE2启动脚本语法检查通过。ANE缓存新增嵌套Python源码与native源码变化／恢复的指纹回归，避免分包后漏掉源码身份。
 
@@ -35,6 +35,47 @@
 
 安装资源同步复验：`python -m pytest -q tests/test_install.py tests/test_deployment_prepare.py` 为69项通过，覆盖本地／管道安装、安全边界及独立部署准备器；Shell／Ruby语法、Ruff check与format check通过。从干净副本再次用所选Python `-I -m pip wheel --no-deps --no-build-isolation` 构建并在临时venv非editable安装（复用现有依赖），直接执行 `install.sh` 和Formula中实际的Python校验片段均通过；39个包文件完整、三个构建入口的隔离help通过。移除临时安装中的 `execution/shm_connector.py` 后，实际安装校验因模块缺失而失败，未误报成功。未执行联网全依赖安装、Homebrew安装或远端curl入口；未编译可选产物、迁移环境或重启服务。
 
+
+## 通用 AOT 命名切换
+
+通用离线构建模块为 `vllm_omni_metal.ops.aot_kernels`，elementwise 构建函数为 `build_elementwise_kernels`，diffusion 构建函数仍为 `build_diffusion_kernels`。安装 CLI 使用 `--with-aot-kernels`；不提供旧模块、函数或 CLI alias/shim。外部适配器、私有 overlay 和部署准备器须同步更新 import、动态模块字符串及构建命令，再从当前源码重新安装并显式构建。
+
+源码和许可检查统一定位 `_native/elementwise.metal`、`_native/diffusion_rotary.metal` 与 `_native/THIRD_PARTY_NOTICES.md`；来源、版权、许可证及上游 URL 保留准确引用。新私有缓存 namespace 为 `aot/elementwise`、`aot/diffusion`：保留旧缓存，不删除、不复用，也不搬移或改名冒充新身份；必须在目标解释器下显式重建。算子基准入口为 `examples/benchmarks/aot_kernels.py`。
+
+这是命名与缓存身份的干净切换，不新增算子、不改变数值／布局／精度／dispatch，也不声明性能收益。下方历史验收不能作为新模块或缓存身份的验证；本次迁移验收单独记录如下。未运行 `prepare_backend.py`、激活 ready/current 或部署、重启服务、修改 topology/model policy、发布远端 curl/tap。
+
+### 本次命名迁移验收
+
+在临时venv使用现有0.32依赖的独立快照（Omni源码`9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`），
+从干净源码副本构建并非editable安装插件wheel，SHA256为
+`f85e5b35dfd49a4a6e0dcf78900850a8d61181cbac6864d7e8c8a3c1fc3fb341`。
+46个包内源码／native资源／许可文件逐一匹配checkout、wheel和实际安装目录；
+旧模块不可导入，旧安装选项被拒绝，所有变更模块均从本次临时安装加载。
+install.sh和Formula的完整Python校验片段、`pip check`及通用CLI的`--help`实际通过。
+这是复用依赖的隔离安装，不是全依赖重新安装或Homebrew/curl入口验收。
+
+实际执行以下显式构建，随后在新进程确认三种dtype的elementwise/diffusion产物加载：
+
+```bash
+<python> -I -m vllm_omni_metal.ops.aot_kernels --diffusion
+<python> -I -m vllm_omni_metal.ane.build --bridge
+```
+
+通用AOT、activation、normalization、rotary、diffusion、ANE及安装专项回归483项通过，
+含真实MPS数值及更新后native host路径；不代表真实模型整任务通过。
+完整非集成一次为1065通过、9跳过、7失败：其中1项仅锁定异常文案，已删除该文案断言，
+保留缺产物拒绝且不JIT的行为检查，并在上述专项回归通过；
+另6项为相邻部署准备器既有current保留／ready重用合同失败，未改写该准备器策略。
+Ruff、变更文件格式、Shell/Ruby语法检查通过。
+
+真实权重局部路径另保存于`outputs/operator-fusions-real-20261027-100610/`：
+Higgs首层1024-token prefill与8次decode的旧／新P0结果逐值相同；
+Qwen首步图像token的真实投影、时间调制、LayerNorm和QKV之后，4个seed均命中
+`qk_norm_rotary:aot`并通过数值对照。这些是局部真实权重验证，不是完整TTS／图片生成；
+完整Higgs双阶段生成实际启动尝试在加载模型前被资源门禁拒绝：当时可用11.48 GiB，
+低于权重、系统余量与KV预算合计要求的13.17 GiB；记录见同目录`native-generation/`。
+Qwen完整生成仍不满足32 GiB可用内存门槛；
+未降低资源或精度要求，也未把没有匹配调用点的gated RMS AdaLN宣称为真实模型通过。
 
 ## 1. 当前源码：0.32 本地资源，完整安装尚未复验
 本地安装器、Formula 和包元数据已对齐 vLLM / vllm-metal 0.32.0、Omni `0.32.0.dev0+cpu` 与插件 `0.32.0.dev0`。复用既有0.32依赖的独立 wheel 安装校验不等于全依赖新安装通过；下列完整安装流程尚未在本次重新执行，远端资源也未发布。
@@ -57,12 +98,19 @@ python -I -m pip check
 
 ```bash
 ./install.sh --venv /absolute/path/to/new-env --with-mps-attention
-# 可选：--with-vpipe（已有 Metal compiler）、--with-ane（已有 clang++/Swift）
+# 可选：--with-aot-kernels（已有 Metal compiler）、--with-ane（已有 clang++/Swift）
 ```
 
 默认不构建。构建失败即退出，不打印安装成功；不安装工具、不下载权重、不转换模型或校准。安装验证及构建以所选 Python 的 `-I` 隔离模式执行，忽略调用方 cwd/PYTHONPATH；模块 `--help` 和非法参数只解析参数，不触发构建。
 
-`--with-vpipe` 现在同时准备原vpipe算子和通用diffusion interleaved RoPE；手动命令为 `python -I -m vllm_omni_metal.ops.vpipe_kernels --diffusion`。`diffusion/ops.py`、`TiledDenseSwiGLU` 和 `_native/diffusion_rotary.metal` 通过现有setuptools规则随源码、wheel与Formula分发，安装烟测检查其导入和资源存在，不修改上游模型registry。模型适配仍在独立部署的私有wheel中。
+`--with-aot-kernels` 同时准备通用 elementwise 算子、diffusion interleaved RoPE以及P1
+gated RMS AdaLN／QK norm+RoPE融合；手动命令为
+`python -I -m vllm_omni_metal.ops.aot_kernels --diffusion`。
+P0复用attention launcher构建入口，native源码变化会生成新缓存身份，须显式重建。
+Python模块与更新后的`_native/diffusion_rotary.metal`、`mps_ops.mm`通过现有setuptools
+规则随源码、wheel与Formula分发，依赖、entry point、package-data及许可证无需新增。
+安装器源码/curl路径与Formula均执行两个新API的CPU数值合同，不触发Metal编译。
+模型适配仍在独立部署的私有wheel中，不修改上游registry或自动激活部署。
 
 安装器只接受新目录或它自己标记创建的环境，不接管任意已有 venv/Homebrew libexec，不使用 `--clear`。失败时保留环境和缓存供诊断、重试。依赖和插件在同一次 uv 解析中安装，保持 vllm-metal 声明的 mlx-lm Git URL 可见。
 
@@ -74,9 +122,53 @@ python -I -m pip check
 
 本次diffusion GPU／分片ANE接入使用共享准备器构建非editable wheel。完整校准基于 `runtime/a46a54e37c719e65`、Omni main `c8ccb8aed59e1db273d9dce6ee91b4f09d30db18`、QwenImage overlay `779257e7887353fb`。其后直接部署时，联网预检更新至 Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d`，当前运行时 `runtime/c076adaf5074c803`、QwenImage overlay `overlays/qwen-image-2.1-turbo/bf033dac54505e3e`；依赖校验、统一模型列表和真实512×512推理通过。依赖下载遇到TLS故障时使用 `UV_OFFLINE=true` 与已有兼容缓存，官方Git预检未跳过，未改核心pins或关闭TLS校验。
 
-生产AOT尚未构建：本机只有Command Line Tools，`xcrun --find metal`／`metallib`失败，Apple官方 `xcodebuild -downloadComponent metalToolchain` 因缺完整Xcode被拒绝。用户已允许安装工具链，但此入口缺少前置Xcode，未安装或下载工具、未重装Homebrew；隔离shader测试不代替AOT。当前 Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d` 的QwenImage真实512×512 GPU off/auto A/B输出一致，但auto慢约3.6%；第0层ANE协同整图scaled max 12.94%超过1%门禁，未发布profile。当前服务GPU优化off、ANE未启用；完整证据见[ANE记录](ane.md)。本次代码仍是本地工作区，不把它描述成已推送的远端入口。
+此前diffusion／ANE验收时生产AOT尚未构建：当时只有Command Line Tools，`xcrun --find metal`／`metallib`失败，Apple官方 `xcodebuild -downloadComponent metalToolchain` 因缺完整Xcode被拒绝。该历史结论不代表本次P0/P1的工具链状态；本次已找到Metal compiler并显式构建新产物，见下方验收记录。此前 Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d` 的QwenImage真实512×512 GPU off/auto A/B输出一致，但auto慢约3.6%；第0层ANE协同整图scaled max 12.94%超过1%门禁，未发布profile。没有借本次算子验证改动服务GPU／ANE默认值；完整证据见[ANE记录](ane.md)。本次代码仍是本地工作区，不把它描述成已推送的远端入口。
 
 更新一个已使用的环境前，先停止所有使用它的服务。本次安装使用新的独立环境，保留运行中的 Higgs 及旧 Homebrew 环境；没有自动迁移服务。
+
+### 2026-10-27：P0/P1 非 editable 与真实 AOT 验收
+
+本次开发`.venv-vllm-omni-metal`仍为0.31，不能据此宣称源码固定的0.32兼容栈通过。
+最初使用现有0.32依赖的临时环境，随后该共享runtime在验证期间被替换；
+最终在临时venv单独安装固定vLLM/Metal0.32、固定`d6db19b4` Omni源码的CPU wheel，
+并复用既有Torch2.13等依赖。Omni从缓存源码的独立副本以版本覆盖重新构建，
+避免uv已有0.31版本元数据冒充0.32；没有改动共享runtime或原开发环境。
+最终Transformers5.19.0、MLX0.32.2，`python -I -m pip check`通过。
+
+从不含build／egg-info的干净插件副本执行
+`python -I -m pip wheel --no-deps --no-build-isolation`，在临时venv非editable安装。
+wheel SHA256为`8d4aab8f15596546f07539addf69f4a01747da0eb35aa3f07ff1cbe653685c8c`。
+46个包内源码／native资源／许可文件逐一匹配checkout、wheel和安装目录；
+变更模块真实路径均位于临时site-packages，不借cwd或PYTHONPATH导入。
+实际执行install.sh和Formula中的完整Python校验片段，均通过，含新增CPU融合数值合同。
+源码/curl共用同一校验；Formula、依赖、entry point和package-data已逐项核对。
+
+以下为历史实际命令对应的当前入口（历史使用迁移前模块名，非本次重跑）；生产不增加JIT：
+
+```bash
+<python> -I -m vllm_omni_metal.ops.mps_attention
+<python> -I -m vllm_omni_metal.ops.aot_kernels --diffusion
+VLLM_OMNI_METAL_INTEGRATION=1 <python> -m pytest -q \
+  tests/test_native_attention.py tests/test_mps_attention.py tests/test_metal_attention.py \
+  tests/test_diffusion_fusions.py tests/test_diffusion_ops.py \
+  tests/test_native_runner.py::test_two_native_language_architectures_on_mps
+<python> -m pytest -q tests/test_install.py
+<python> -m pytest -q -m 'not integration'
+```
+
+真实AOT独立烟测确认三种dtype的两个`:aot`路径实际命中、rounded residual逐值一致、
+GQA与batched频率数值对照，以及context1024的attention偏移输出直写／四次无中间同步
+重放／非法alias不改KV。FP32归约误差和低精度末位差异保留原有精度门槛。
+290项专项回归（含随机Llama/Qwen3多步生成）及42项安装回归通过。
+全量非集成为1066通过、9跳过、6失败：失败均在相邻`prepare_backend.py`的
+current保留／ready重用合同，不是新增算子数值失败；未改该部署准备器。
+Ruff check、本次8个Python文件format check及Shell/Ruby语法检查通过。
+
+性能采样受并行负载影响明显，不将单次算子计时写成稳定整模型收益。
+完整`install.sh`入口另作尝试：离线缺wheel缓存，联网解析／下载在600秒超时，
+因此不宣称全依赖新安装通过。上述非editable安装、实际校验和AOT执行均已完成，
+不等于远端curl/tap已发布、Homebrew已重装或现有部署已迁移；未重启服务、
+下载模型权重或修改模型GPU／ANE／量化默认值。
 
 ## 2. Homebrew：发布本次改动后
 
@@ -133,13 +225,13 @@ source ~/.venv-vllm-omni-metal/bin/activate
 
 需要现有 Apple Command Line Tools（clang++/Swift）及 macOS 15+；没有时明确失败，不下载工具。Homebrew 命令见 Formula caveats。该步骤只构建 host 工具，不下载/转换模型，也不代表 ANE 可用；模型适配器还须显式准备权重图并以完整 pipeline 延迟批准 profile。默认 auto 无匹配 profile 时保留 GPU；当前真实 YuE2 图 relative L2 5.499% 超过1%门槛被拒绝，不得放宽门槛。FP16近似精度与生命周期见 [GPU + ANE 协议](ane.md)。没有重启当前服务或发布远端入口。
 
-## 可选：vpipe 源算子 metallib
+## 可选：通用 elementwise metallib
 
 ```bash
-python -I -m vllm_omni_metal.ops.vpipe_kernels
+python -I -m vllm_omni_metal.ops.aot_kernels
 ```
 
-需要**已安装的 Apple Metal compiler**（`xcrun --find metal`）；它与仅能编译 host Objective-C++ 的 Command Line Tools 不等同。也可安装时显式选择 `--with-vpipe`。构建在本地私有 cache、离线执行，不安装工具、不修改上游依赖。生产 worker 缺少匹配 metallib 时保留原路径，绝不在 startup/request 自动编译。本机缺 compiler，因此 packed Q/K RoPE 等新增源码仅完成隔离 shader/OOT 数值与计时，不宣称 AOT 或真实 worker 已可用；单行小 SwiGLU 无稳定收益，仍不接入默认路径。来源和限制见[执行协议](generic-backend.md#成熟方案续移植packed-qk-rope)。
+需要**已安装的 Apple Metal compiler**（`xcrun --find metal`）；它与仅能编译 host Objective-C++ 的 Command Line Tools 不等同。也可安装时显式选择 `--with-aot-kernels`，同时准备 diffusion AOT。构建在本地私有 cache、离线执行，不安装工具、不修改上游依赖。生产 worker 缺少匹配 metallib 时保留原路径，绝不在 startup/request 自动编译。早期缺 compiler 时，packed Q/K RoPE 等源码仅完成隔离 shader/OOT 数值与计时；后续 P0/P1 生产 AOT 验收见上方记录，不能据此跳过命名切换后的显式重建与验证。单行小 SwiGLU 无稳定收益，仍不接入默认路径。来源和限制见[执行协议](generic-backend.md#成熟方案续移植packed-qk-rope)。
 
 ## 显式选择性 W8A16
 
@@ -225,7 +317,7 @@ Shell/Ruby语法通过。以官方0.32基础依赖实际执行安装器/Formula 
 未生成图片或发布联合批准。详细证据为
 `outputs/qwen-joint-direct-20261023-100747-verification.json`及对应三个真实尝试目录。
 
-### 2026-10-23：vpipe预测分配复验
+### 2026-10-23：行数平衡预测分配复验（参考 vpipe）
 
 新增 `ane/allocation.py` 随现有包发现规则分发，无额外依赖、entry point或native资源变化。
 源码/curl共用安装器及Formula的实际Python校验清单均导入该模块。共享/私有准备器
@@ -438,7 +530,7 @@ VLLM_OMNI_METAL_INTEGRATION=1 .venv-vllm-omni-metal/bin/python -m pytest -q
 
 **既有完整后端验收（历史记录，非本次重跑）：**
 
-本轮在全新私有安装器环境实际解析/安装223个包，验证固定版本、MPS generator、随包10项 native资源，并显式准备 attention host launcher；额外以污染的 cwd/PYTHONPATH 重跑，隔离验证仍通过。随后实际调用部署准备器的干净副本 wheel 安装路径：非 editable 导入、`pip check`、三个可选模块及服务CLI help通过；禁用MLX、请求期编译和显式同步后，FP32/FP16/BF16六个序列、每序列四步 attention 正确执行，记录在 `outputs/metal-install-current/report.json`。最终非集成回归 **259 passed / 143 deselected**，旋转/vpipe针对性回归（含实际MPS）**90 passed**，Ruff、格式、shell和Ruby语法通过。安装mock/CPU准备器回归不冒充真实安装；此前277/1是历史集成结果，不作为本轮完整重跑结论。未实际运行会停服务的总部署激活流程，未发布远端curl或重装Homebrew。
+本轮在全新私有安装器环境实际解析/安装223个包，验证固定版本、MPS generator、随包10项 native资源，并显式准备 attention host launcher；额外以污染的 cwd/PYTHONPATH 重跑，隔离验证仍通过。随后实际调用部署准备器的干净副本 wheel 安装路径：非 editable 导入、`pip check`、三个可选模块及服务CLI help通过；禁用MLX、请求期编译和显式同步后，FP32/FP16/BF16六个序列、每序列四步 attention 正确执行，记录在 `outputs/metal-install-current/report.json`。最终非集成回归 **259 passed / 143 deselected**，旋转／通用 elementwise 针对性回归（含实际MPS）**90 passed**，Ruff、格式、shell和Ruby语法通过。安装mock/CPU准备器回归不冒充真实安装；此前277/1是历史集成结果，不作为本轮完整重跑结论。未实际运行会停服务的总部署激活流程，未发布远端curl或重装Homebrew。
 
 **本次安装资源同步验收：** 从干净副本重新构建 wheel，并在临时非 editable 环境安装；依赖通过显式 `.pth` 复用所选开发环境，没有重新解析完整依赖。安装后的全部30个包文件（含10项 native资源）与当前源码逐字节一致。使用仅替代 Homebrew 声明 DSL 的临时执行器，实际运行 Formula 的测试块：cwd/PYTHONPATH 污染场景修复前失败，改用所选 Python `-I` 后通过，覆盖版本、MPS generator、资源及四个 CLI help；这不是实际 `brew install/test`。安装/部署回归54项通过，Ruff、格式与shell/Ruby语法通过。持续同步指令已写入 `AGENTS.md`，临时环境与执行器已清理；未发布、切换服务或重跑模型生成。
 

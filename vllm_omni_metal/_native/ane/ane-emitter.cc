@@ -12,7 +12,7 @@
 #include <random>
 #include <sstream>
 
-namespace vpipe {
+namespace vllm_omni_metal::ane {
 
 namespace {
 
@@ -395,9 +395,9 @@ AneEmitter::emit_mil_(const AneGraphSpec& s)
     // (4096 x 16384, 6144 ANE rows) the whole FF's error against fp64
     // halves, 7.1e-3 -> 3.3e-3, for +9.3% ANE time (27.0 -> 29.5 ms per
     // 1k rows). Nothing inside overflows: x^3 saturating to inf takes
-    // tanh to +-1, never inf - inf. VPIPE_ANE_GELU_OP=1 emits the op
+    // tanh to +-1, never inf - inf. VLLM_OMNI_METAL_ANE_GELU_OP=1 emits the op
     // instead, for A/B.
-    static const bool kGeluOp = std::getenv("VPIPE_ANE_GELU_OP") != nullptr;
+    static const bool kGeluOp = std::getenv("VLLM_OMNI_METAL_ANE_GELU_OP") != nullptr;
     if (!kGeluOp) {
       const std::string T =
           "tensor<fp16, [" + std::to_string(s.M) + ", " +
@@ -468,8 +468,8 @@ AneEmitter::emit_mil_(const AneGraphSpec& s)
     // the op gives at 512 rows. On a Krea-2 1024^2 image with the ANE
     // feed-forward, 35.2 -> 39.3 dB against GPU-only; the module is 5-8%
     // slower and a whole step ~0.5%, the extra ANE time hiding under the
-    // GPU's rows. VPIPE_ANE_SILU_OP=1 emits the op instead, for A/B.
-    static const bool kSiluOp = std::getenv("VPIPE_ANE_SILU_OP") != nullptr;
+    // GPU's rows. VLLM_OMNI_METAL_ANE_SILU_OP=1 emits the op instead, for A/B.
+    static const bool kSiluOp = std::getenv("VLLM_OMNI_METAL_ANE_SILU_OP") != nullptr;
     const std::string T = "tensor<fp16, [" + std::to_string(s.M) + ", " +
                           std::to_string(s.N) + "]> ";
     auto cst = [&](const char* nm, double v) {
@@ -657,4 +657,4 @@ AneEmitter::write_bundle(const std::string& dir, const std::string& mil,
 }
 
 
-} // namespace vpipe
+} // namespace vllm_omni_metal::ane

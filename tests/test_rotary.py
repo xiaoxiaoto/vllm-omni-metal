@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Scope and cache contracts for optional vpipe NeoX RoPE."""
+"""Scope and cache contracts for optional AOT NeoX RoPE."""
 
 import os
 from types import SimpleNamespace
@@ -47,12 +47,12 @@ def test_rotary_registration_is_oot_not_in_tree():
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_packed_qk_adapter_preserves_scaled_cache_and_position_bounds(monkeypatch, dtype):
-    from vllm_omni_metal.ops import vpipe_kernels
+    from vllm_omni_metal.ops import aot_kernels
 
     library = torch.mps.compile_shader(
-        f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n" + vpipe_kernels._SOURCE.read_text()
+        f"#define ELEMENTWISE_ELT {aot_kernels._SCALARS[dtype]}\n" + aot_kernels._SOURCE.read_text()
     )
-    monkeypatch.setattr(vpipe_kernels, "_library", lambda _: library)
+    monkeypatch.setattr(aot_kernels, "_library", lambda _: library)
     monkeypatch.setattr(
         rotary,
         "get_current_vllm_config_or_none",

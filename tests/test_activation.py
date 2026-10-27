@@ -168,14 +168,14 @@ def test_mps_compiled_activation_parity_without_mutation_or_donation(dtype, shap
 @MPS
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_torch_stream_activation_producer_consumer_without_mlx(monkeypatch, dtype):
-    from vllm_omni_metal.ops import vpipe_kernels
+    from vllm_omni_metal.ops import aot_kernels
 
     config = native_config()
 
     library = torch.mps.compile_shader(
-        f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n" + vpipe_kernels._SOURCE.read_text()
+        f"#define ELEMENTWISE_ELT {aot_kernels._SCALARS[dtype]}\n" + aot_kernels._SOURCE.read_text()
     )
-    monkeypatch.setattr(vpipe_kernels, "_library", lambda _: library)
+    monkeypatch.setattr(aot_kernels, "_library", lambda _: library)
     monkeypatch.setitem(sys.modules, "mlx", None)
     torch.manual_seed(29)
     x = torch.randn(32, 16384, dtype=dtype, device="mps")
@@ -200,7 +200,7 @@ def test_activation_cast_before_gate_is_discriminating(monkeypatch, dtype):
     mask = expected != unrounded
     assert mask.sum() > 50
     # Exercise the bridge even when an optional Torch-stream artifact is installed.
-    monkeypatch.setattr(activation.vpipe_kernels, "supports_silu", lambda _: False)
+    monkeypatch.setattr(activation.aot_kernels, "supports_silu", lambda _: False)
     actual = activation._silu_and_mul_mps(torch.cat([gate, up]).to("mps")).cpu()
     torch.testing.assert_close(actual[mask], expected[mask], atol=0, rtol=0)
 

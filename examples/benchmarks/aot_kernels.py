@@ -12,7 +12,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
-from vllm_omni_metal.ops import rotary, vpipe_kernels
+from vllm_omni_metal.ops import aot_kernels, rotary
 
 
 def main():
@@ -39,12 +39,12 @@ def main():
         parser.error("benchmark exceeds 64 MiB or 3 GiB headroom budget")
     if args.compile_for_test:
         library = torch.mps.compile_shader(
-            f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n"
-            + vpipe_kernels._SOURCE.read_text()
+            f"#define ELEMENTWISE_ELT {aot_kernels._SCALARS[dtype]}\n"
+            + aot_kernels._SOURCE.read_text()
         )
-        vpipe_kernels._library = lambda _: library
-    elif vpipe_kernels._library(dtype) is None:
-        parser.error("explicitly build vpipe metallibs first; no worker JIT fallback")
+        aot_kernels._library = lambda _: library
+    elif aot_kernels._library(dtype) is None:
+        parser.error("explicitly build AOT metallibs first; no worker JIT fallback")
     torch.manual_seed(67)
     config = VllmConfig()
     config.parallel_config.worker_cls = "vllm_omni_metal.native.worker.MetalARWorker"
@@ -54,7 +54,7 @@ def main():
             x = torch.randn(args.rows, 2 * args.hidden_size, device="mps", dtype=dtype)
             functions = [
                 lambda: SiluAndMul.forward_native(x),
-                lambda: vpipe_kernels.silu_and_mul(x),
+                lambda: aot_kernels.silu_and_mul(x),
             ]
         else:
             layer = RotaryEmbedding(128, 128, 128, 10000, True, dtype).to("mps")

@@ -106,7 +106,7 @@ def backend(monkeypatch, tmp_path):
             "_native/metal/header.h": "header",
             "_native/pytorch_backend/mps_ops.mm": "launcher",
             "_native/ane/bridge.swift": "bridge",
-            "_native/vpipe.metal": "shader",
+            "_native/elementwise.metal": "shader",
         },
     )
     monkeypatch.setattr(module, "SOURCE", source)
@@ -170,7 +170,7 @@ def test_backend_failure_does_not_publish_or_switch_current(backend, failure_sta
         "_native/metal/header.h",
         "_native/pytorch_backend/mps_ops.mm",
         "_native/ane/bridge.swift",
-        "_native/vpipe.metal",
+        "_native/elementwise.metal",
     ],
 )
 def test_backend_changes_create_new_verified_environment(backend, changed):

@@ -136,12 +136,9 @@ class MetalAttentionImpl(AttentionImpl):
         q = query.reshape(-1, self.num_heads, self.head_size)
         k = key.reshape(-1, self.num_kv_heads, self.head_size)
         v = value.reshape(-1, self.num_kv_heads, self.head_size)
-        if output is not None and (
-            output.shape != query.shape
-            or output.dtype != query.dtype
-            or output.device != query.device
-        ):
-            raise ValueError("output shape/device/dtype must match query")
+        from vllm_omni_metal.ops.metal_attention import validate_output
+
+        validate_output(output, query, key, value, kv_cache)
         if not lengths or len(starts) != len(lengths) + 1 or len(tables) != len(lengths):
             raise ValueError("inconsistent request/block metadata")
         if starts[0] != 0 or starts[-1] != len(q) or len(k) != len(q) or len(v) != len(q):
@@ -182,9 +179,15 @@ class MetalAttentionImpl(AttentionImpl):
         from vllm_omni_metal.ops.metal_attention import paged_attention, supports_paged_attention
 
         if supports_paged_attention(q, kv_cache):
-            result = paged_attention(q, k, v, kv_cache, meta, self.scale, self.sliding_window)
+            destination = (
+                output.view_as(q) if output is not None and output.is_contiguous() else None
+            )
+            result = paged_attention(
+                q, k, v, kv_cache, meta, self.scale, self.sliding_window, output=destination
+            )
             if output is not None:
-                output.copy_(result.reshape_as(output))
+                if destination is None:
+                    output.copy_(result.reshape_as(output))
                 return output
             return result
         results = []

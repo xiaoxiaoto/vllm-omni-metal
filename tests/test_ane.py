@@ -51,7 +51,7 @@ def test_execution_scope_uses_real_ir_dataclass_and_resource_settings(tmp_path, 
 
     monkeypatch.setattr("vllm_omni_metal.ops.mps_attention.get_mps_ops", lambda: None)
     monkeypatch.setattr(
-        "vllm_omni_metal.ops.vpipe_kernels._artifact_path", lambda dtype: tmp_path / "absent"
+        "vllm_omni_metal.ops.aot_kernels._artifact_path", lambda dtype: tmp_path / "absent"
     )
     config = SimpleNamespace(
         cache_config=CacheConfig(),

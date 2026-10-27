@@ -5,7 +5,7 @@ import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
-from vllm_omni_metal.ops import vpipe_kernels
+from vllm_omni_metal.ops import aot_kernels
 
 
 @RotaryEmbedding.register_oot
@@ -35,7 +35,7 @@ class MetalRotaryEmbedding(RotaryEmbedding):
                 for t in tensors
             )
         )
-        if not supported or vpipe_kernels._library(query.dtype) is None:
+        if not supported or aot_kernels._library(query.dtype) is None:
             return self.forward_native(positions, query, key)
         # Preserve upstream cache construction/scaling, dtype matching and index validation.
         cache = self._match_cos_sin_cache_dtype(query)
@@ -48,10 +48,10 @@ class MetalRotaryEmbedding(RotaryEmbedding):
             and selected.shape == (positions.numel(), self.head_size)
             and selected.is_contiguous()
         ):
-            return vpipe_kernels.cached_neox_rope_qk(query, key, selected, self.head_size)
+            return aot_kernels.cached_neox_rope_qk(query, key, selected, self.head_size)
         cos, sin = (table.float().contiguous() for table in selected.chunk(2, dim=-1))
         rotated = [
-            vpipe_kernels.cached_neox_rope(
+            aot_kernels.cached_neox_rope(
                 tensor.view(positions.numel(), -1, self.head_size), cos, sin, self.rotary_dim
             ).reshape(tensor.shape)
             for tensor in tensors

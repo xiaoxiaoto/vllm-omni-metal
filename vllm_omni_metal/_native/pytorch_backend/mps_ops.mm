@@ -5,6 +5,8 @@
 #include <torch/extension.h>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
+#include <mach/mach.h>
+#include <mutex>
 #include <unordered_map>
 
 #include "../metal/metal_device.h"
@@ -27,6 +29,53 @@ class PagedAttention {
   id<MTLLibrary> nax_library_ = nil;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines_;
   int gpu_cores_;
+  // One bounded workspace belongs to this launcher and its first split stream.
+  // Other streams use private temporaries: no resource crosses stream ownership.
+  std::mutex mutex_;
+  at::mps::MPSStream* scratch_stream_ = nullptr;
+  Tensor scratch_tmp_, scratch_sums_, scratch_maxes_;
+  static constexpr int64_t kScratchBudget = 256LL * 1024 * 1024;
+
+  static void check_headroom(int64_t bytes) {
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page_size;
+    auto host = mach_host_self();
+    auto stats_result = host_statistics64(
+        host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count);
+    auto page_result = host_page_size(host, &page_size);
+    mach_port_deallocate(mach_task_self(), host);
+    TORCH_CHECK(stats_result == KERN_SUCCESS && page_result == KERN_SUCCESS,
+                "Cannot determine MPS attention system memory headroom");
+    const uint64_t available =
+        (static_cast<uint64_t>(vm.free_count) + vm.inactive_count) * page_size;
+    TORCH_CHECK(available >= 3ULL * 1024 * 1024 * 1024 + bytes,
+                "MPS attention allocation requires 3 GiB system memory headroom");
+  }
+
+  void scratch(at::mps::MPSStream* stream, const Tensor& q,
+               int64_t elements, int64_t statistics, Tensor& tmp, Tensor& sums, Tensor& maxes) {
+    const auto bytes = elements * q.element_size() + statistics * 8;
+    TORCH_CHECK(bytes <= kScratchBudget, "MPS attention scratch exceeds 256 MiB per-call budget");
+    if (scratch_stream_ == nullptr) scratch_stream_ = stream;
+    const bool owner = stream == scratch_stream_;
+    const bool reusable = owner && scratch_tmp_.defined() &&
+        scratch_tmp_.scalar_type() == q.scalar_type() &&
+        scratch_tmp_.numel() >= elements && scratch_sums_.numel() >= statistics;
+    if (reusable) {
+      tmp = scratch_tmp_; sums = scratch_sums_; maxes = scratch_maxes_;
+      return;
+    }
+    check_headroom(bytes);
+    tmp = at::empty({elements}, q.options());
+    sums = at::empty({statistics}, q.options().dtype(at::kFloat));
+    maxes = at::empty_like(sums);
+    if (owner) {
+      // Keep only the latest capacity, never a shape-indexed unbounded cache.
+      // Previously encoded Metal commands retain old buffers through completion.
+      scratch_tmp_ = tmp; scratch_sums_ = sums; scratch_maxes_ = maxes;
+    }
+  }
 
   id<MTLComputePipelineState> pipeline(const std::string& name, bool split = false,
                                       int window_q = 0) {
@@ -96,8 +145,16 @@ class PagedAttention {
                const Tensor& blocks, const Tensor& lens, const Tensor& cu,
                const Tensor& out, int max_seq_len, double scale,
                int sliding_window, double softcap, int window_seqlen_q) {
+    // Serialize the entire encode transaction (including pipeline/cache mutation).
+    // This is a CPU lock, not a GPU wait; command order protects same-stream reuse.
+    std::lock_guard<std::mutex> lock(mutex_);
     for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu, &out})
       TORCH_CHECK(t->is_mps(), "All paged attention buffers must be on MPS");
+    for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu})
+      TORCH_CHECK(!out.is_alias_of(*t),
+                  "Attention output must not share storage with inputs or KV cache");
+    TORCH_CHECK(!out.requires_grad() && !out.is_conj() && !out.is_neg(),
+                "Attention output must be a plain tensor without autograd");
     TORCH_CHECK(q.dim() == 3 && q.is_contiguous() &&
                 (q.size(2) == 64 || q.size(2) == 96 || q.size(2) == 128 ||
                  q.size(2) == 256 || q.size(2) == 512),
@@ -122,7 +179,12 @@ class PagedAttention {
                 "Attention metadata must be contiguous");
     const int tokens = q.size(0), heads = q.size(1), kv_heads = kc.size(2);
     const int seqs = lens.numel();
-    const int parts = (max_seq_len + kPartitionSize - 1) / kPartitionSize;
+    TORCH_CHECK(max_seq_len > 0 && tokens > 0 && heads > 0 && kv_heads > 0 && seqs > 0,
+                "Attention dimensions and maximum sequence length must be positive");
+    const int parts = (static_cast<int64_t>(max_seq_len) + kPartitionSize - 1) / kPartitionSize;
+    const int64_t statistics = static_cast<int64_t>(tokens) * heads * parts;
+    TORCH_CHECK(statistics <= kScratchBudget / (head_size * q.element_size() + 8),
+                "MPS attention scratch exceeds 256 MiB per-call budget");
     TORCH_CHECK(k.sizes() == v.sizes() && k.dim() == 3 && k.size(0) == tokens &&
                 k.size(1) == kv_heads && k.size(2) == head_size &&
                 k.stride(2) == 1 && k.stride(1) == head_size &&
@@ -151,15 +213,13 @@ class PagedAttention {
             dt, dt, dt, head_size, block_size, split ? kPartitionSize : 0);
     auto attn = pipeline(name, split, window_q);
     id<MTLComputePipelineState> reduce = nil;
+    auto stream = at::mps::getCurrentMPSStream();
     Tensor tmp, sums, maxes;
     if (split) {
-      tmp = at::empty({tokens, heads, parts, head_size}, q.options());
-      sums = at::empty({tokens, heads, parts}, q.options().dtype(at::kFloat));
-      maxes = at::empty_like(sums);
+      scratch(stream, q, statistics * head_size, statistics, tmp, sums, maxes);
       reduce = pipeline(
           kernels::paged_reduce_kernel_name(dt, head_size, kPartitionSize));
     }
-    auto stream = at::mps::getCurrentMPSStream();
     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
       @autoreleasepool {
         auto enc = stream->commandEncoder();
@@ -211,6 +271,9 @@ class PagedAttention {
           buffer(enc, 7, cu); scalar<int>(enc, 8, seqs);
           [enc dispatchThreadgroups:MTLSizeMake(heads, tokens, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+          // The next call may overwrite the workspace on this encoder. Order its
+          // writes after this reducer's reads without waiting for GPU completion.
+          [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
       }
     });

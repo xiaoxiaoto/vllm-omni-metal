@@ -106,7 +106,7 @@ ANE 以256行为单位分担若干完整块，至少一行留给 GPU，不填充
 FP16/BF16/FP32、非方阵和暂存重放的15项回归亦已通过。小型128→192图未通过
 NE preferred 检查而明确拒绝；这些证据均不代表三个完整模型已获批或可设默认。
 
-## vpipe 式离线预测分配
+## 行数平衡离线预测分配
 
 `ane.allocation.RowAllocator` 按同步实测的 GPU 秒/行与 ANE 秒/块计算：
 `T(c) = max(gpu_seconds_per_row * (M - c*C), ane_seconds_per_chunk * c)`。
@@ -128,7 +128,7 @@ NE preferred 检查而明确拒绝；这些证据均不代表三个完整模型�
 ```bash
 python -I -m vllm_omni_metal.ane.build --bridge
 python -I -m vllm_omni_metal.ane.projection \
-  --rows 1025 --dtype bfloat16 --bias --allocation vpipe --warmup 8
+  --rows 1025 --dtype bfloat16 --bias --allocation predictive --warmup 8
 ```
 
 这是随机激活的真实NE投影烟测，不是Higgs完整TTS。仅显式离线命令准备图，
@@ -146,4 +146,4 @@ python -I -m vllm_omni_metal.ane.projection \
 
 随后显式 `--gpu-only --attention-ab` 完成真实 AR→NAR→VAE 生成，比较的是旧 MLX bridge 与当前 Torch-stream attention；详见[真实 YuE2 对照](generic-backend.md#真实-yue2当前-torch-stream-attention-对照)。该结果不包含ANE，也不代表随包未补丁Omni已支持YuE2。未停止其他服务、放宽资源线或复用旧身份图。
 
-源码来自固定 vpipe Apache-2.0 版本，见 [`_native/VPIPE.md`](../vllm_omni_metal/_native/VPIPE.md)。emitter 直接生成 vpipe 格式的 compiled bundle，不是 Apple 公共转换器；系统更新可能不兼容，须重建并重新通过计划与数值检查。
+源码来自固定 vpipe Apache-2.0 版本，见 [`_native/THIRD_PARTY_NOTICES.md`](../vllm_omni_metal/_native/THIRD_PARTY_NOTICES.md)。emitter 延续该来源实现的 compiled bundle 格式，不是 Apple 公共转换器；系统更新可能不兼容，须重建并重新通过计划与数值检查。运行时参数使用功能名 `--allocation predictive`；历史参考项目名不是兼容别名。

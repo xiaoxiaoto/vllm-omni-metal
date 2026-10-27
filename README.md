@@ -64,7 +64,7 @@ Apple M4 Pro、BF16、batch=4、context=2048、Q/KV heads=16/4、head size=128�
 
 第二阶段已接入通用 **RMSNorm / 残差归一化**：移植上游已合并 [vllm-metal #858](https://github.com/vllm-project/vllm-metal/pull/858) 的小型 IR adapter，调用 PyTorch 已有的融合 MPS RMSNorm，不写新 kernel、不升级依赖。原生 Metal worker 的 FP16/BF16、同 dtype/device 的一维 learned weight、完整 variance 默认选择 `omni_mps`；FP32、无 weight、variance override 或其他合法不匹配参数保留上游 `native`（MPS 输入仍在 MPS）。用户显式 IR 优先级保持优先，普通 LLM 配置不受影响。
 
-残差路径保留 **FP32 相加、未舍入 sum 的 variance、归一化先 cast 再乘 learned weight**。现有 Torch 分解继续作为后备；显式预编译 vpipe 产物可启用连续无梯度 FP16/BF16 的 **add+RMSNorm 单 kernel**，缺产物、不支持布局或 epsilon 保持原路径。新 kernel 已通过显式测试编译的数值及随机模型生成对照，生产 AOT 构建/加载尚未验收。
+残差路径保留 **FP32 相加、未舍入 sum 的 variance、归一化先 cast 再乘 learned weight**。现有 Torch 分解继续作为后备；显式预编译通用 AOT 产物可启用连续无梯度 FP16/BF16 的 **add+RMSNorm 单 kernel**，缺产物、不支持布局或 epsilon 保持原路径。早期已通过显式测试编译的数值及随机模型生成对照；当时生产 AOT 尚未验收，不代表迁移后产物已可用。
 
 ```bash
 .venv-vllm-omni-metal/bin/python examples/benchmarks/normalization.py --require-speedup
@@ -72,13 +72,13 @@ Apple M4 Pro、BF16、batch=4、context=2048、Q/KV heads=16/4、head size=128�
 
 Apple M4 Pro、BF16、4×4096、30 次同步计时：普通 RMSNorm 0.182 → 0.152 ms（1.19×），残差归一化 0.191 → 0.170 ms（1.12×）。这是一次指定形状的算子微基准，不代表整模型吞吐；复现会有负载波动。
 
-第三阶段接入通用 **SiLU×gate（SwiGLU）融合**：通过上游 CustomOp OOT 合同，缺少显式 vpipe AOT 产物时复用 MLX 编译 SiLU 与官方 DLPack bridge，有产物则可选择同一 Torch stream 的 packed kernel，不替换模型方法。仅原生 worker 的 FP32/FP16/BF16、连续 1–3 维、无梯度、最后一维为偶数且输出元素数 ≥262144 时启用；小 decode、其他合法输入保留原设备上的上游实现。保留 SiLU 的 FP32 计算及乘 gate 前的 dtype 舍入；可用 `custom_ops=["none", "-silu_and_mul"]` 显式关闭。这不是 GEMM+SwiGLU 投影级融合。
+第三阶段接入通用 **SiLU×gate（SwiGLU）融合**：通过上游 CustomOp OOT 合同，缺少显式通用 AOT 产物时复用 MLX 编译 SiLU 与官方 DLPack bridge，有产物则可选择同一 Torch stream 的 packed kernel，不替换模型方法。仅原生 worker 的 FP32/FP16/BF16、连续 1–3 维、无梯度、最后一维为偶数且输出元素数 ≥262144 时启用；小 decode、其他合法输入保留原设备上的上游实现。保留 SiLU 的 FP32 计算及乘 gate 前的 dtype 舍入；可用 `custom_ops=["none", "-silu_and_mul"]` 显式关闭。这不是 GEMM+SwiGLU 投影级融合。
 
 ```bash
 .venv-vllm-omni-metal/bin/python examples/benchmarks/activation.py --require-speedup
 ```
 
-M4 Pro、BF16、32×8192、30 次同步中位数：原生 0.343 → 编译路径 0.170 ms（约 **2.0×**），包含 OOT dispatch、桥接和同步。小块桥接收益不稳定，因此不默认优化小 decode。随机大 MLP Llama/Qwen3 已确认真实 worker 命中新路径、greedy 与 seed 回归通过；这仍不是整模型吞吐结果。可选缓存表 NeoX RoPE 的 vpipe 移植及限制见下节；隔离算子验证不等于默认 worker 已启用。
+M4 Pro、BF16、32×8192、30 次同步中位数：原生 0.343 → 编译路径 0.170 ms（约 **2.0×**），包含 OOT dispatch、桥接和同步。小块桥接收益不稳定，因此不默认优化小 decode。随机大 MLP Llama/Qwen3 已确认真实 worker 命中新路径、greedy 与 seed 回归通过；这仍不是整模型吞吐结果。可选缓存表 NeoX RoPE 的通用移植及限制见下节；隔离算子验证不等于默认 worker 已启用。
 
 GPU + ANE 合作提供独立、通用的 dense SwiGLU contract；默认 auto 只消费绑定源码/设备/权重/完整 pipeline 配置的离线校准，缺少匹配准备产物即保留 GPU，不在 worker/request 编译。FP16 math 必须由外部模型适配器显式选择，不是 BF16 等价替代；本插件不接管模型 registry 或捆绑 YuE2 实现。本次真实 YuE2 图自检因 relative L2 5.50% 超过1%门槛被拒绝，没有可用的本次 ANE 加速结论。准备与误差限制见 [GPU + ANE 协议](docs/ane.md)。
 
@@ -88,7 +88,7 @@ down 的浮点回退。真实 NE 数值烟测不等于模型批准；Higgs、Qwe
 必须分别完成整任务质量、实际双路径命中、相对同量化 GPU 基线的3%收益及释放重放，
 不能拼接两份独立批准或只改 flags 设默认。详见[联合投影合同](docs/ane.md#单线性投影与联合动态量化)。
 
-单投影离线校准可通过 `set_benchmark_chunks("auto")` 使用 vpipe 式预测分配：
+单投影离线校准可通过 `set_benchmark_chunks("auto")` 使用行数平衡预测分配（参考 vpipe）：
 按同步实测的 GPU 秒/行与 ANE 秒/块更新速率，枚举合法 split，仅预测改善超过5%
 才调整。`finish_audit()` 冻结最后实际审核过的分配；生产不在线改变已批准策略。
 这不解除256行分块限制，也不替代完整任务的1%质量及3%收益门槛。
@@ -100,21 +100,30 @@ down 的浮点回退。真实 NE 数值烟测不等于模型批准；Higgs、Qwe
 .venv-vllm-omni-metal/bin/python examples/benchmarks/attention.py --require-speedup
 ```
 
-编译产物在用户私有 cache，绑定源文件、Torch 环境及 Python ABI；随后新 worker 的支持域 FP32/FP16/BF16 自动选择 Torch-stream。无匹配产物保留原 bridge；已存在但损坏/不安全的产物明确报错。attention 的元数据异步送入 Torch stream，KV 写读按同一 stream 排序，无 MLX 导入或每层显式 GPU wait；**不代表整个模型没有跨框架操作**，缺少 vpipe AOT 时大输入 SwiGLU 仍使用 bridge。
+编译产物在用户私有 cache，绑定源文件、Torch 环境及 Python ABI；随后新 worker 的支持域 FP32/FP16/BF16 自动选择 Torch-stream。无匹配产物保留原 bridge；已存在但损坏/不安全的产物明确报错。attention 的元数据异步送入 Torch stream，KV 写读按同一 stream 排序，无 MLX 导入或每层显式 GPU wait；**不代表整个模型没有跨框架操作**，缺少通用 elementwise AOT 时大输入 SwiGLU 仍使用 bridge。
 
 M4 Pro、BF16、batch=4、context=2048、16/4 heads、head size=128，20 次同步实测：gather+SDPA 5.936 ms、MLX bridge 0.515 ms、Torch-stream 0.477 ms；相对 bridge 约 **1.08×**，相对原 gather 约 12.45×。仅为指定形状微基准，新路径已验证独立数值对照、KV strides/offset、请求隔离与真实随机模型生成；真实大模型与 M5 NAX 尚未验收。
 
-### vpipe 通用算子移植与当前未完成项
+### 通用 AOT 算子移植与当前未完成项
 
-固定参考 [tgo-app-dev/vpipe](https://github.com/tgo-app-dev/vpipe/tree/6a721d5c3b74ded70001f7c02121f14ae8f5321a)（Apache-2.0），移植通用 packed SwiGLU、缓存表 NeoX RoPE，并将 `rms_norm_fast_f16` 的 SIMD reduction 改编为等价 add-before-norm 双输出；做必要的 dtype/layout 适配，不移植模型包装、频率重算、视频/量化或 Gemma 专用 residual 逻辑。来源和精度合同见 [执行协议](docs/generic-backend.md#vpipe-通用片段)及打包的 `_native/VPIPE.md`。
+固定参考 [tgo-app-dev/vpipe](https://github.com/tgo-app-dev/vpipe/tree/6a721d5c3b74ded70001f7c02121f14ae8f5321a)（Apache-2.0），移植通用 packed SwiGLU、缓存表 NeoX RoPE，并将 `rms_norm_fast_f16` 的 SIMD reduction 改编为等价 add-before-norm 双输出；做必要的 dtype/layout 适配，不移植模型包装、频率重算、视频/量化或 Gemma 专用 residual 逻辑。来源和精度合同见 [执行协议](docs/generic-backend.md#通用-aot-算子与来源)及打包的 `_native/THIRD_PARTY_NOTICES.md`。
 
-生产 worker **仅加载显式预编译 metallib**，缺失则保留原路径；运行 `python -I -m vllm_omni_metal.ops.vpipe_kernels` 需要已安装的 Apple Metal compiler。本机 `xcrun --find metal` 失败，未安装工具。因此本次仅验证隔离 shader、OOT cache 合同及显式测试基准，不宣称新 RoPE 已在真实 worker 中加速。
+生产 worker **仅加载显式预编译 metallib**，缺失则保留原路径；运行 `python -I -m vllm_omni_metal.ops.aot_kernels` 需要已安装的 Apple Metal compiler。早期验证时本机 `xcrun --find metal` 失败，因此当时只有隔离 shader、OOT cache 合同及显式测试基准证据；下方 P0/P1 记录单独说明本次已可用的工具链与 AOT 验收，不追溯宣称早期模型已验证新产物。
 
 M4 Pro / BF16：缓存 RoPE（4 rows、hidden 4096、Q/KV heads32/8、head128）0.239 → 0.203 ms（1.18×）；单行 SwiGLU（width4096）0.138 → 0.138 ms（无收益），**不接入默认小 decode 路径**。FP32 attention batch4/context2048/head128 的三路为 6.377 / 0.617 / 0.597 ms，Torch-stream 比 bridge 快约1.03×。这些都不是模型吞吐。
 
-新增三路交错算子基准和 spawned native worker 四模式生成对照；随机 Llama/Qwen3 的新 SwiGLU/norm 整模型结果波动大，未证明稳定收益，见[逐项实测](docs/generic-backend.md#2026-10-15-逐项实测)。释放内存后，独立私有 overlay 已完成[真实 YuE2 attention 对照](docs/generic-backend.md#真实-yue2当前-torch-stream-attention-对照)，该结果不包含 ANE 或缺少产物的 vpipe AOT 融合。仍未完成：GEMM+SwiGLU、QK norm+RoPE+分页 KV 的通用跨算子接入，小 decode 稳定加速，生产 vpipe AOT、Higgs 新路径复验、生产负载和 M5 NAX。没有自动下载、停止现有服务或放宽水位；本地代码不能冒充已发布入口。
+新增三路交错算子基准和 spawned native worker 四模式生成对照；随机 Llama/Qwen3 的新 SwiGLU/norm 整模型结果波动大，未证明稳定收益，见[逐项实测](docs/generic-backend.md#2026-10-15-逐项实测)。释放内存后，独立私有 overlay 已完成[真实 YuE2 attention 对照](docs/generic-backend.md#真实-yue2当前-torch-stream-attention-对照)，该历史结果不包含 ANE 或当时缺少产物的通用 elementwise AOT 融合。仍未完成：GEMM+SwiGLU、QK norm+RoPE+分页 KV 的通用跨算子接入，小 decode 稳定加速、Higgs 新路径复验、生产负载和 M5 NAX。P0/P1 及后续命名切换各自需要匹配产物和验证，不能沿用早期“缺 AOT”的状态概括当前代码，也不能把迁移视为新算子或性能收益。没有自动下载、停止现有服务或放宽水位；本地代码不能冒充已发布入口。
 
 本轮继续采用 [vllm-metal packed Q/K RoPE](https://github.com/vllm-project/vllm-metal/blob/f2e26b342c93d6c705ebee0950a0baf8025ee46d/vllm_metal/metal/kernels_v2/rope.metal)（Apache-2.0），完整 FP16/BF16 NeoX 的 Q/K 共用一次 dispatch，省去输入 clone，保留上游缓存边界和每次乘法舍入。M4 Pro BF16、32 rows、hidden4096 的实际 OOT 同步中位数 0.3334→0.1689 ms（1.97×）；这是显式测试编译，不是生产 AOT 或 YuE2 整模型加速。详细来源、对照口径及不采用方案见[成熟方案续移植](docs/generic-backend.md#成熟方案续移植packed-qk-rope)。
+
+参考 h3.c 的 P0/P1 通用机制现已加入：Torch-stream attention 可直写连续 caller output，
+按实例/stream 有界复用 split scratch；diffusion 提供显式 `gated_residual_rms_adaln`
+与 `qk_norm_rotary` 单 dispatch 融合，保留各自舍入、广播和布局合同。
+这不包含 AR QK norm+RoPE+分页 KV 的整段融合，也不自动修改模型或启用量化。
+生产继续只加载显式 AOT；本次工具链已可用并完成新增 diffusion shader 的真实 AOT
+构建和小张量执行，不沿用历史“缺工具链”的当前状态判断。
+指定形状 QK 有收益，gated AdaLN 尚未证明稳定加速；不宣称整模型提速。
+详见 [P0/P1 合同](docs/generic-backend.md#输出复用与跨算子融合p0--p1)。
 
 ## 环境与安装
 
@@ -151,7 +160,9 @@ vllm-omni --help
 
 默认创建源码目录中的 `.venv-vllm-omni-metal` 并 editable 安装；可用 `./install.sh --venv /absolute/path/to/new-env` 指定独立环境。原有开发 `.venv` 保持不变。
 
-`./install.sh --with-mps-attention` 显式构建并验证 host launcher；`--with-vpipe` 需要已有 Metal compiler，`--with-ane` 只准备 CoreML host 工具，不表示 ANE 已通过模型校准。普通安装不编译。安装校验/构建使用所选环境 `-I`，忽略 cwd/PYTHONPATH；源码、curl 脚本与 Formula 分发同一组 native 资源，但未发布远端入口不会自动包含本地改动。
+`./install.sh --with-mps-attention` 显式构建并验证 host launcher；`--with-aot-kernels` 显式准备通用 elementwise/diffusion AOT，需要已有 Metal compiler；`--with-ane` 只准备 CoreML host 工具，不表示 ANE 已通过模型校准。普通安装不编译。安装校验/构建使用所选环境 `-I`，忽略 cwd/PYTHONPATH；源码、curl 脚本与 Formula 分发同一组 native 资源，但未发布远端入口不会自动包含本地改动。
+
+通用 AOT 入口已干净切换为 `vllm_omni_metal.ops.aot_kernels`，不保留旧模块或 CLI 别名。外部适配器须同步更新 import，再重新安装并显式重建；新缓存位于 `aot/elementwise` 和 `aot/diffusion`，旧缓存保留但不复用或搬移冒充新身份。源码及许可资源为 `_native/elementwise.metal` 和 `_native/THIRD_PARTY_NOTICES.md`。本次命名迁移不激活部署、不重启服务、不发布远端，也不声明新的数值或性能结果；详见[切换步骤](docs/installation.md#通用-aot-命名切换)。
 
 ### Homebrew 与 curl
 

@@ -12,7 +12,7 @@ import torch
 from vllm import ir
 
 import vllm_omni_metal.ops.normalization  # noqa: F401
-from vllm_omni_metal.ops import vpipe_kernels
+from vllm_omni_metal.ops import aot_kernels
 
 
 def main():
@@ -37,14 +37,14 @@ def main():
     ):
         parser.error("benchmark exceeds 64 MiB budget or 3 GiB system headroom")
     dtype = getattr(torch, args.dtype)
-    original_library = vpipe_kernels._library
+    original_library = aot_kernels._library
     if args.compile_for_test:
         library = torch.mps.compile_shader(
-            f"#define VPIPE_ELT {vpipe_kernels._SCALARS[dtype]}\n"
-            + vpipe_kernels._SOURCE.read_text()
+            f"#define ELEMENTWISE_ELT {aot_kernels._SCALARS[dtype]}\n"
+            + aot_kernels._SOURCE.read_text()
         )
-        vpipe_kernels._library = lambda _: library
-    original_supports = vpipe_kernels.supports_add_rms_norm
+        aot_kernels._library = lambda _: library
+    original_supports = aot_kernels.supports_add_rms_norm
     torch.manual_seed(17)
     results = {}
     try:
@@ -61,7 +61,7 @@ def main():
             for iteration in range(args.iterations + 10):
                 order = routes if iteration % 2 == 0 else tuple(reversed(routes))
                 for route in order:
-                    vpipe_kernels.supports_add_rms_norm = (
+                    aot_kernels.supports_add_rms_norm = (
                         (lambda *unused: False) if route == "previous_mps" else original_supports
                     )
                     provider = "native" if route == "native" else "omni_mps"
@@ -102,8 +102,8 @@ def main():
                 ),
             }
     finally:
-        vpipe_kernels._library = original_library
-        vpipe_kernels.supports_add_rms_norm = original_supports
+        aot_kernels._library = original_library
+        aot_kernels.supports_add_rms_norm = original_supports
     chip = subprocess.run(
         ["sysctl", "-n", "machdep.cpu.brand_string"],
         capture_output=True,

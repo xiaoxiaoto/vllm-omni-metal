@@ -126,14 +126,14 @@ def test_install_rejects_unsupported_platform_before_any_install(
     installer, tmp_path, overrides, piped
 ):
     run, log = installer
-    result = run("--venv", str(tmp_path / "unused"), "--with-vpipe", piped=piped, **overrides)
+    result = run("--venv", str(tmp_path / "unused"), "--with-aot-kernels", piped=piped, **overrides)
     assert result.returncode != 0 and not log.exists()
     assert not (tmp_path / "unused").exists()
 
 
 @pytest.mark.parametrize("piped", [False, True])
 @pytest.mark.parametrize(
-    "invalid", [("--unknown",), ("--venv",), ("--venv", ""), ("--venv", "--with-vpipe")]
+    "invalid", [("--unknown",), ("--venv",), ("--venv", ""), ("--venv", "--with-aot-kernels")]
 )
 def test_install_rejects_invalid_arguments_before_any_changes(installer, tmp_path, piped, invalid):
     run, log = installer
@@ -202,7 +202,7 @@ def test_default_install_does_not_require_optional_compilers(installer, tmp_path
 
 
 @pytest.mark.parametrize("piped", [False, True])
-@pytest.mark.parametrize("flag", ["--with-mps-attention", "--with-vpipe", "--with-ane"])
+@pytest.mark.parametrize("flag", ["--with-mps-attention", "--with-aot-kernels", "--with-ane"])
 def test_requested_build_failure_prevents_install_success(installer, tmp_path, piped, flag):
     run, _ = installer
     venv = tmp_path / "build failure"
@@ -231,7 +231,7 @@ def test_attention_load_failure_prevents_install_success(installer, tmp_path, pi
     assert "安装完成" not in result.stdout
 
 
-@pytest.mark.parametrize("module", ["ops.mps_attention", "ops.vpipe_kernels"])
+@pytest.mark.parametrize("module", ["ops.mps_attention", "ops.aot_kernels"])
 @pytest.mark.parametrize("arguments,expected", [(["--help"], 0), (["--unknown-option"], 2)])
 def test_optional_build_cli_does_not_build_for_help_or_invalid_arguments(
     tmp_path, module, arguments, expected
