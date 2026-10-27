@@ -21,6 +21,42 @@
 而不切换共享 `current` 或升级其他模型；私有 ready 与 attention launcher
 仍须在该 overlay 的 `-I` 解释器下重新校验。
 
+## 显式磁盘后备投影安装验收
+
+`execution.streaming` 是纯 Python 显式接口，现有 setuptools 自动发现、
+源码／curl 安装器和 Formula 分发同一实现；两处安装校验已加入该模块。
+没有新增依赖、native 源码、编译入口、环境变量或 entry point，
+`pyproject.toml` 与许可证资源无需改变。接口及接入限制见
+[磁盘后备 dense 投影](generic-backend.md#磁盘后备-dense-投影)。
+安装插件不会自动启用 streaming，私有加载器仍须显式逐投影导出和写回。
+
+本次使用临时 Python3.12 venv，复用已安装0.32共享环境的依赖路径；
+只向临时环境安装测试／构建工具和非 editable 插件，没有改变共享环境或部署。
+从排除 `.git`、build、dist、egg-info、环境与缓存的干净源码副本构建 wheel：
+
+```bash
+<python> -I -m pip wheel --no-deps --no-build-isolation -w <temporary-wheels> <clean-source>
+<python> -I -m pip install --ignore-installed --no-deps <wheel>
+<python> -I -m pip check
+VLLM_OMNI_METAL_INTEGRATION=1 <python> -I -m pytest --import-mode=importlib -q \
+  <checkout>/tests/test_streaming.py <checkout>/tests/test_install.py \
+  <checkout>/tests/test_native_worker.py <checkout>/tests/test_plugin.py
+```
+
+wheel SHA256：`3a352f5012ce92113c494180b6762dd0a85b1b26f849d3f53738631f711365b7`。
+47个随包源码／native／许可文件逐一匹配 wheel、checkout 与临时安装，
+`-I` 实际执行两处完整安装 Python 校验片段通过；
+安装后的双投影三 dtype MPS 流式流水线各重放三次，输出与 resident 完全相同。
+上述安装与执行边界回归179项通过，新增流式专项99项通过；
+Ruff check、变更 Python format check、Shell／Ruby 语法通过。
+临时工具最初安装的 setuptools84 不满足 vLLM 约束，已仅在临时 venv
+对齐78.1.1，最终 `pip check` 通过。
+
+导入完整上游安装栈时仍输出 FFmpeg/PyAV/OpenCV 的重复 Objective-C 类警告；
+本次未处理此独立依赖问题，也没有将无崩溃视为媒体路径已验证。
+这不是全依赖新安装、物理 SSD 性能、超 RAM 整模或完整媒体生成验收。
+未执行 Homebrew 重装、远端 curl/tap 发布、私有模型接入或服务迁移／重启。
+
 ## 内部 API 功能分包切换
 
 本次将内部模块干净切换至 `vllm_omni_metal.execution`、`.native`、`.diffusion`、`.ops` 和 `.ane` 功能包；各包 `__init__.py` 保持惰性，不重新导出迁移模块，**不提供旧路径兼容 shim**。外部模型适配器、独立 overlay 和部署脚本必须同步更新直接导入、`import_module` 字符串、worker/backend 动态类路径及构建命令；例如通用算子从 `vllm_omni_metal.diffusion.ops` 导入，ANE API 从 `vllm_omni_metal.ane.runtime` 导入，离线构建入口为 `vllm_omni_metal.ane.build`。

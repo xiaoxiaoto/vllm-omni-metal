@@ -100,6 +100,7 @@ from vllm_omni_metal.ane.runtime import DenseSwiGLU, TiledDenseSwiGLU, execution
 from vllm_omni_metal.quantization.capture import CaptureSession, DiskCaptures
 from importlib.resources import files
 for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector',
+               'execution.streaming',
                'native.attention', 'native.compat', 'native.runner', 'native.worker',
                'diffusion.attention', 'diffusion.config', 'diffusion.ops', 'diffusion.worker',
                'ops.mps_attention', 'ops.metal_attention', 'ops.aot_kernels',

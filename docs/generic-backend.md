@@ -96,6 +96,59 @@ Apple M4 Pro / 48 GiB、macOS 26.6.2（25G83），Torch 2.13.0、Transformers 5.
 
 通用 dense SwiGLU 的 GPU + ANE 合作 contract、显式 CoreML 准备、完整 pipeline 校准和 FP16 误差边界见[独立协议](ane.md)。该路径不替代完整模型适配入口；未知形状、设备或校准配置保留 GPU。
 
+## 磁盘后备 dense 投影
+
+`execution.streaming.prepare_linear` 和 `StreamedLinear` 是显式、仅推理的普通
+`torch.nn.Linear` 接口，不按模型名自动替换。参考
+[SSD streaming 容量与工作集边界](https://github.com/antirez/ds4/blob/ee7e8405232c8971000cc7ba2b945b00bf6d20d3/docs/SSD_STREAMING.md)
+的机制思路；本实现独立编写，不复制其模型、GGUF、MoE 路由或热专家名单。
+源项目按路由缓存专家；这里是 dense 投影，每次调用都顺序读取全部权重块，不能
+套用其吞吐数据或宣称比 resident 执行更快。
+
+- 离线准备只接受 CPU 连续 FP32/FP16/BF16 普通 Linear，bias 须匹配，
+  不丢弃 hooks。逐输出行保存 weight 与 bias 的原始字节，不切分输入 reduction
+  维度，不 cast、量化或使用 pickle。源模块保持不变，导出不保留其引用。
+- 目录必须是全新绝对 `Path`，祖先和文件拒绝符号链接；目录0700、文件0600。
+  manifest schema1 绑定 dtype、维度、行覆盖、文件长度与每块 SHA256；
+  重复 JSON 键、损坏、截断、权限改变和不完整覆盖明确拒绝。每次 forward
+  复核 manifest 并校验实际读取块，文件不是可信执行对象。
+- `max_chunk_bytes` 限制导出块的 weight+bias 字节；`max_weight_bytes` 限制加载块，
+  两者默认64MiB。至少须容纳一完整输出行，过小明确报错；加载预算不能小于已有块。
+  执行只持有一块 host 权重和一块 MPS 权重，每块输出拷贝完成后同步，再释放引用。
+  该上限分别约束 host/device 原始权重，不是 RSS、MPS allocator 或全任务内存保证：
+  输入、完整输出、块结果、后端 scratch、文件系统缓存、其他层和 KV 另占空间。
+- 输入为非空、匹配 dtype/宽度、无梯度 MPS 张量；支持1D、多维与非连续布局。
+  不支持训练、`.to()`／dtype cast、pickle 或 `state_dict` 保存／恢复；
+  重建时重新打开原 artifact。调用和关闭在实例锁下串行；context manager／
+  `close()` 关闭 fd，后续调用拒绝，不删除权重文件。输出不借用权重块存储。
+- 调用方须先检查 tied/shared 权重和外部引用，再显式写回实际执行模块并释放原投影。
+  vLLM packed/tuple-return 投影、直接 Tensor 融合路径、量化模块不能冒充普通 Linear。
+  不修改 registry，不自动打开 diffusion/native offload 配置，不包装任意模型方法。
+
+示例（`projection` 是加载器提供的 CPU 普通 Linear，`x` 是匹配的 MPS 输入）：
+
+```python
+from pathlib import Path
+from vllm_omni_metal.execution.streaming import prepare_linear, StreamedLinear
+
+artifact = Path("/absolute/private/checkpoint/projection")  # 必须尚不存在
+prepare_linear(projection, artifact, max_chunk_bytes=8 * 1024**2)
+# 实际适配器应在此将 StreamedLinear 写回调用方，并清除原 projection 的全部引用。
+with StreamedLinear(artifact, max_weight_bytes=8 * 1024**2) as streamed:
+    output = streamed(x)
+```
+
+导出仍要求至少一个完整投影驻留 CPU；若先加载整模再替换，不能消除已经发生的加载峰值。
+逐投影 checkpoint 接入由外部加载器完成；这里不提供超 RAM 整模 loader、
+跨层预取、常驻缓存或 MoE 执行。每块同步与磁盘读取可能显著降低 decode 吞吐，
+内存充足时应使用 resident 执行。
+
+本次真实 MPS 双投影烟测使用257→129→33、GELU、非连续输入和8192字节块预算，
+三种 dtype 各重复执行三次，对照同权重 resident pipeline 的最大绝对误差均为0，
+且确认原 Linear 已释放、关闭后拒绝执行。FP32 两投影文件共150156字节，
+最大块7740字节；FP16/BF16 共75078字节，最大块7998字节。
+这些是小算路容量与数值证据，不是超 RAM 真实模型、物理 SSD 吞吐或完整媒体生成验收。
+
 ## 显式选择性 W8A16
 
 `quantization/linear.py` 提供通用 `QuantizedLinear.from_linear`、`build_profile`、

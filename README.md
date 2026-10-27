@@ -19,6 +19,12 @@ Apple Silicon 上的 **vLLM-Omni out-of-tree Metal 后端**，复用上游模型
 
 **通用执行后端不等于所有 Omni 模型和功能都已移植。** 当前原生路径限单 MPS 设备、`uni`、同步调度、未量化 dense decoder attention。encoder multimodal 输入、prompt embeddings、auxiliary Talker MTP、prefix/model-state caching、logprobs、structured decoding、LoRA、跨引擎 KV、睡眠和 offload 未支持。CUDA/Triton 专用模型算子仍需独立移植；不自动 CPU fallback。
 
+显式 `execution.streaming.StreamedLinear` 另支持普通 dense Linear 的磁盘后备执行：
+离线逐投影导出 CPU 原精度权重，MPS 按完整输入维度、输出行分块读取与计算。
+FP32/FP16/BF16 不量化、不做 CPU 计算回退；每块同步释放临时权重，以容量换吞吐。
+它不自动接管 checkpoint loader 或解除上游 offload 限制，也不是 MoE 专家缓存。
+预算、生命周期与接入示例见[磁盘后备投影合同](docs/generic-backend.md#磁盘后备-dense-投影)。
+
 原生 generation pipeline 的 diffusion SDPA 通过本插件的 `MetalSDPABackend` 进入上游通用 Torch 实现，避免上游 `AttentionImpl.forward` 缺少 OOT 平台分派而报 `No forward implementation for platform`；不改变模型 registry、采样或上游 attention 类。mask、GQA、causal、scale 与布局的真实 MPS 数值回归见 `tests/test_diffusion_attention.py` 和[执行合同](docs/generic-backend.md)。
 
 `diffusion/ops.py` 另提供显式、通用的 Diffusers RMSNorm、独立 gate/up SwiGLU、interleaved complex RoPE，复用 MPS fused norm、已有 MLX bridge 与可选 Torch-stream AOT。它们不会全局改写上游模型，需独立适配器接入；不是把 AR 分页 KV／NeoX 算子直接套给 diffusion。`TiledDenseSwiGLU` 保持原256MiB与1%门槛，支持一般大 inner 的有界分片。QwenImage 私有适配已完成小算子、生命周期和真实单层权重验证，但完整图片 A/B 受内存门禁、生产 AOT 受完整 Xcode 缺失阻塞；不能宣称整模型已提速或默认 ANE 已启用。见[diffusion 合同](docs/generic-backend.md#diffusion-显式算子接入)和[分片 ANE](docs/ane.md#有界-inner-分片独立-gateupdown)。

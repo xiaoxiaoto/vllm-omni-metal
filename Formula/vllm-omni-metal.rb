@@ -102,6 +102,7 @@ class VllmOmniMetal < Formula
       import vllm_omni_metal
       assert Path(vllm_omni_metal.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
       for module in ('execution.compat', 'execution.runtime', 'execution.shm_connector',
+                     'execution.streaming',
                      'native.attention', 'native.compat', 'native.runner', 'native.worker',
                      'diffusion.attention', 'diffusion.config', 'diffusion.ops', 'diffusion.worker',
                      'ops.mps_attention', 'ops.metal_attention', 'ops.aot_kernels',
